@@ -1,53 +1,57 @@
 {{
   PixelDriver_E6804.spin
 
-  4-port WS2811 parallel bit-bang pixel output driver for the SanDevices E6804, using the traced pin mapping in
-  docs/pin_mapping_E6804.md: port J1=P0, J2=P4, J3=P8, J4=P12.
+  4-port APA102/SK9822-style clocked pixel output driver for the SanDevices E6804, using the traced pin mapping in
+  docs/pin_mapping_E6804.md: data J1=P0/J2=P4/J3=P8/J4=P12, clock J1=P21/J2=P22/J3=P20/J4=P19.
 
-  Runs continuously in its own cog, reading directly from the same hub-RAM frame buffer and port table that
-  DDP_Parser.spin writes into (same (startChannel, numBytes) pair format, same buffer address) - no copying, no
-  hand-off signaling needed, it just keeps re-reading and re-transmitting the latest frame buffer contents.
+  Rewritten from an earlier WS2811 single-wire version once tracing found a dedicated clock pin per port - these
+  boards drive 2-wire clocked pixel chips (APA102/SK9822), not single-wire WS2811/WS2812. Clocked protocols have no
+  tight pulse-width timing requirement (the receiver samples on clock edges, not pulse duration), so unlike the old
+  WS2811 driver this one does NOT need all 4 ports bit-banged in parallel lockstep - it just sends them one after
+  another in a simple loop, which is both simpler and still fast enough (4 ports x ~50 pixels x 4 bytes/pixel x 8
+  bits, at the clock rate below, comfortably clears 20-40fps).
 
-  Timing targets classic WS2811 (~400kHz-class, 12V "bullet"/C9-style pixel strings), which is what this board's
-  target community (doityourselfchristmas.com-style large outdoor pixel displays) overwhelmingly uses - NOT the
-  faster 800kHz WS2812/WS2812B timing used in 5V addressable-LED-strip hobbyist projects. If the actual strings in
-  use turn out to be WS2812-class, change T0H_CYC/T1H_CYC/BIT_PERIOD_CYC below (values in comments) - nothing else
-  needs to change.
+  Per-port frame format (APA102/SK9822):
+    - start frame:  4 bytes of 0x00
+    - per pixel:    1 byte 0xFF (brightness field forced to max - 0b111 + 5-bit brightness all set; DDP already
+                    sends full-scale color values, so no separate dimming is applied here), then the pixel's 3 raw
+                    bytes from the frame buffer, UNCHANGED ORDER - same "pass channel order through as received"
+                    approach as the rest of this firmware. If colors come out swapped, fix it at the sender (e.g.
+                    xLights' per-output color-order setting), not here.
+    - end frame:    enough extra clock pulses (data held low) to latch the last pixel through the chain -
+                    ceil(pixelCount/16) bytes of 0x00, per Start()'s endFrameBytesPtr argument (computed in
+                    Main.spin with real division, since PASM on the P1 has no divide instruction)
 
-  Uses the standard Propeller multi-pin parallel bit-bang technique: raise all active pins high together at the
-  start of each bit time, drop "0"-bit pins low at T0H, drop all remaining ("1"-bit) pins low at T1H, then wait out
-  the rest of the bit period - so all 4 output streams share one timing reference and stay in lockstep regardless
-  of their individual byte content.
-
-  NOT YET COMPILED OR TESTED ON HARDWARE - no Propeller toolchain available in this environment, and PASM timing
-  in particular needs verification against a logic analyzer/scope once you have a board and toolchain. Verify bit
-  timing against your actual pixel string's datasheet before trusting this on real hardware.
+  NOT YET COMPILED OR TESTED ON HARDWARE - no Propeller toolchain available in this environment. Verify clock/data
+  relationship and end-frame length against your actual APA102/SK9822 strings (a logic analyzer helps) before
+  trusting this on real hardware.
 }}
 
 CON
-  NUM_PORTS       = 4
+  NUM_PORTS         = 4
 
-  ' WS2811 (400kHz-class) bit timing at 80MHz core clock (12.5ns/cycle). For WS2812/WS2812B (800kHz) strings
-  ' instead, use BIT_PERIOD_CYC=100, T0H_CYC=32, T1H_CYC=64.
-  BIT_PERIOD_CYC  = 200         ' 2.5us total bit period
-  T0H_CYC         = 40          ' 0.5us - high time for a '0' bit
-  T1H_CYC         = 96          ' 1.2us - high time for a '1' bit
-  RESET_CYC       = 4800        ' 60us low gap between frames (latch/reset)
+  ' Clock pacing - not a protocol requirement (APA102/SK9822 have no minimum clock period, only a maximum), just a
+  ' conservative rate for signal integrity over long cable runs through the board's 74HCT541 buffers. ~1MHz.
+  CLK_HALF_CYC      = 40          ' 0.5us high, 0.5us low -> 1us period -> ~1MHz clock
 
 VAR
   long  cog
-  long  paramBlock[3]
+  long  paramBlock[5]
 
-PUB Start(fbPtr, portTablePtr, pinsPtr) : ok
-'' fbPtr        - hub address of the shared pixel frame buffer (same one DDP_Parser.spin writes into)
-'' portTablePtr - hub address of NUM_PORTS x (long startChannel, long numBytes) pairs - same table/format
-''                DDP_Parser.spin uses, so both objects can be started with the same pointer
-'' pinsPtr      - hub address of NUM_PORTS longs: the Propeller pin number for each port, in the same order
-''                as the port table (J1, J2, J3, J4 -> P0, P4, P8, P12 per docs/pin_mapping_E6804.md)
+PUB Start(fbPtr, portTablePtr, dataPinsPtr, clockPinsPtr, endFrameBytesPtr) : ok
+'' fbPtr             - hub address of the shared pixel frame buffer (same one DDP_Parser.spin writes into)
+'' portTablePtr      - hub address of NUM_PORTS x (long startChannel, long numBytes) pairs - same table/format
+''                     DDP_Parser.spin uses
+'' dataPinsPtr       - hub address of NUM_PORTS longs: data pin per port (J1..J4 -> P0,P4,P8,P12)
+'' clockPinsPtr      - hub address of NUM_PORTS longs: clock pin per port (J1..J4 -> P21,P22,P20,P19)
+'' endFrameBytesPtr  - hub address of NUM_PORTS longs: precomputed ceil(pixelCount/16) per port - computed in
+''                     Spin (Main.spin) since PASM has no divide instruction
   Stop
   paramBlock[0] := fbPtr
   paramBlock[1] := portTablePtr
-  paramBlock[2] := pinsPtr
+  paramBlock[2] := dataPinsPtr
+  paramBlock[3] := clockPinsPtr
+  paramBlock[4] := endFrameBytesPtr
   cog := cognew(@entry, @paramBlock) + 1
   ok := cog <> 0
 
@@ -64,30 +68,56 @@ entry                   mov     t1, par
                         add     t1, #4
                         rdlong  tblAddr, t1
                         add     t1, #4
-                        rdlong  pinAddr, t1
+                        rdlong  dataAddr, t1
+                        add     t1, #4
+                        rdlong  clkAddr, t1
+                        add     t1, #4
+                        rdlong  endAddr, t1
 
-                        rdlong  pin0, pinAddr
-                        mov     t2, pinAddr
+                        rdlong  dpin0, dataAddr
+                        mov     t2, dataAddr
                         add     t2, #4
-                        rdlong  pin1, t2
+                        rdlong  dpin1, t2
                         add     t2, #4
-                        rdlong  pin2, t2
+                        rdlong  dpin2, t2
                         add     t2, #4
-                        rdlong  pin3, t2
+                        rdlong  dpin3, t2
 
-                        mov     mask0, #1
-                        shl     mask0, pin0
-                        mov     mask1, #1
-                        shl     mask1, pin1
-                        mov     mask2, #1
-                        shl     mask2, pin2
-                        mov     mask3, #1
-                        shl     mask3, pin3
+                        rdlong  cpin0, clkAddr
+                        mov     t2, clkAddr
+                        add     t2, #4
+                        rdlong  cpin1, t2
+                        add     t2, #4
+                        rdlong  cpin2, t2
+                        add     t2, #4
+                        rdlong  cpin3, t2
 
-                        mov     allmask, mask0
-                        or      allmask, mask1
-                        or      allmask, mask2
-                        or      allmask, mask3
+                        mov     dmask0, #1
+                        shl     dmask0, dpin0
+                        mov     dmask1, #1
+                        shl     dmask1, dpin1
+                        mov     dmask2, #1
+                        shl     dmask2, dpin2
+                        mov     dmask3, #1
+                        shl     dmask3, dpin3
+
+                        mov     cmask0, #1
+                        shl     cmask0, cpin0
+                        mov     cmask1, #1
+                        shl     cmask1, cpin1
+                        mov     cmask2, #1
+                        shl     cmask2, cpin2
+                        mov     cmask3, #1
+                        shl     cmask3, cpin3
+
+                        mov     allmask, dmask0
+                        or      allmask, dmask1
+                        or      allmask, dmask2
+                        or      allmask, dmask3
+                        or      allmask, cmask0
+                        or      allmask, cmask1
+                        or      allmask, cmask2
+                        or      allmask, cmask3
 
                         mov     dira, allmask
                         mov     outa, #0
@@ -109,107 +139,126 @@ entry                   mov     t1, par
                         add     t2, #4
                         rdlong  len3, t2
 
-refresh                 mov     byteIdx, #0
-                        mov     ptr0, fbAddr
-                        add     ptr0, start0
-                        mov     ptr1, fbAddr
-                        add     ptr1, start1
-                        mov     ptr2, fbAddr
-                        add     ptr2, start2
-                        mov     ptr3, fbAddr
-                        add     ptr3, start3
+                        rdlong  endf0, endAddr
+                        mov     t2, endAddr
+                        add     t2, #4
+                        rdlong  endf1, t2
+                        add     t2, #4
+                        rdlong  endf2, t2
+                        add     t2, #4
+                        rdlong  endf3, t2
 
-                        mov     maxlen, len0
-                        max     maxlen, len1
-                        max     maxlen, len2
-                        max     maxlen, len3
+refresh                 mov     curData, dmask0
+                        mov     curClk, cmask0
+                        mov     curPtr, fbAddr
+                        add     curPtr, start0
+                        mov     curLen, len0
+                        mov     curEnd, endf0
+                        call    #sendPort
 
-byteloop                cmp     byteIdx, len0     wc
-              if_b      rdbyte  b0, ptr0
-              if_nc     mov     b0, #0
-                        cmp     byteIdx, len1     wc
-              if_b      rdbyte  b1, ptr1
-              if_nc     mov     b1, #0
-                        cmp     byteIdx, len2     wc
-              if_b      rdbyte  b2, ptr2
-              if_nc     mov     b2, #0
-                        cmp     byteIdx, len3     wc
-              if_b      rdbyte  b3, ptr3
-              if_nc     mov     b3, #0
+                        mov     curData, dmask1
+                        mov     curClk, cmask1
+                        mov     curPtr, fbAddr
+                        add     curPtr, start1
+                        mov     curLen, len1
+                        mov     curEnd, endf1
+                        call    #sendPort
 
-                        mov     bitIdx, #8
+                        mov     curData, dmask2
+                        mov     curClk, cmask2
+                        mov     curPtr, fbAddr
+                        add     curPtr, start2
+                        mov     curLen, len2
+                        mov     curEnd, endf2
+                        call    #sendPort
 
-bitloop                 mov     time, cnt
-                        add     time, #40               ' small lead-in before first waitcnt
-
-                        mov     activemask, #0
-                        cmp     byteIdx, len0     wc
-              if_b      or      activemask, mask0
-                        cmp     byteIdx, len1     wc
-              if_b      or      activemask, mask1
-                        cmp     byteIdx, len2     wc
-              if_b      or      activemask, mask2
-                        cmp     byteIdx, len3     wc
-              if_b      or      activemask, mask3
-
-                        or      outa, activemask       ' t=0: all active pins go high together
-
-                        mov     zeromask, #0
-                        test    b0, #%1000_0000   wz
-              if_z      or      zeromask, mask0
-                        test    b1, #%1000_0000   wz
-              if_z      or      zeromask, mask1
-                        test    b2, #%1000_0000   wz
-              if_z      or      zeromask, mask2
-                        test    b3, #%1000_0000   wz
-              if_z      or      zeromask, mask3
-
-                        add     time, #T0H_CYC
-                        waitcnt time, #0
-                        andn    outa, zeromask         ' t=T0H: '0'-bit pins drop low
-
-                        add     time, #(T1H_CYC - T0H_CYC)
-                        waitcnt time, #0
-                        andn    outa, activemask       ' t=T1H: remaining ('1'-bit) pins drop low
-
-                        add     time, #(BIT_PERIOD_CYC - T1H_CYC)
-                        waitcnt time, #0                ' t=BIT_PERIOD: next bit
-
-                        shl     b0, #1
-                        shl     b1, #1
-                        shl     b2, #1
-                        shl     b3, #1
-
-                        djnz    bitIdx, #bitloop
-
-                        add     ptr0, #1
-                        add     ptr1, #1
-                        add     ptr2, #1
-                        add     ptr3, #1
-                        add     byteIdx, #1
-                        cmp     byteIdx, maxlen   wc
-              if_b      jmp     #byteloop
-
-                        mov     time, cnt
-                        add     time, resetCyc          ' RESET_CYC (4800) is too big for a 9-bit PASM immediate,
-                        waitcnt time, #0                ' so it's stashed in a long and referenced directly below
+                        mov     curData, dmask3
+                        mov     curClk, cmask3
+                        mov     curPtr, fbAddr
+                        add     curPtr, start3
+                        mov     curLen, len3
+                        mov     curEnd, endf3
+                        call    #sendPort
 
                         jmp     #refresh
 
-' parameters (set once at startup) - named differently from Start()'s fbPtr/portTablePtr/pinsPtr params above:
-' Spin1 requires every symbol in a file (CON/VAR/params/locals AND DAT labels/res vars) to be globally unique
-' within that file, so these PASM-side copies can't reuse the Spin method's parameter names.
+' --- sendPort: sends one port's full APA102/SK9822 frame -------------------------------------------------------
+' in:  curData, curClk (pin masks), curPtr (frame buffer address for this port), curLen (bytes = pixelCount*3),
+'      curEnd (precomputed end-frame byte count)
+sendPort                mov     sendCount, #4           ' start frame: 4 bytes of 0x00
+                        mov     sendByte, #0
+:startloop              call    #clockByte
+                        djnz    sendCount, #:startloop
+
+                        mov     remaining, curLen
+:pixloop                cmp     remaining, #0     wz
+              if_z      jmp     #:pixdone
+                        mov     sendByte, #$FF          ' brightness byte, forced to max
+                        call    #clockByte
+                        rdbyte  sendByte, curPtr
+                        call    #clockByte
+                        add     curPtr, #1
+                        rdbyte  sendByte, curPtr
+                        call    #clockByte
+                        add     curPtr, #1
+                        rdbyte  sendByte, curPtr
+                        call    #clockByte
+                        add     curPtr, #1
+                        sub     remaining, #3
+                        jmp     #:pixloop
+:pixdone
+
+                        mov     sendCount, curEnd       ' end frame: curEnd bytes of 0x00
+                        mov     sendByte, #0
+:endloop                cmp     sendCount, #0     wz
+              if_z      jmp     #:enddone
+                        call    #clockByte
+                        sub     sendCount, #1
+                        jmp     #:endloop
+:enddone
+sendPort_ret            ret
+
+' --- clockByte: shifts sendByte out MSB-first on curData/curClk ------------------------------------------------
+clockByte               mov     bitCnt, #8
+:bitloop                test    sendByte, #%1000_0000   wz
+              if_nz     or      outa, curData
+              if_z      andn    outa, curData
+
+                        mov     ctime, cnt
+                        add     ctime, #CLK_HALF_CYC
+                        waitcnt ctime, #0
+                        or      outa, curClk            ' clock high - receiver samples data now
+
+                        add     ctime, #CLK_HALF_CYC
+                        waitcnt ctime, #0
+                        andn    outa, curClk            ' clock low
+
+                        shl     sendByte, #1
+                        djnz    bitCnt, #:bitloop
+clockByte_ret           ret
+
+' parameters (set once at startup)
 fbAddr                  res     1
 tblAddr                 res     1
-pinAddr                 res     1
-pin0                    res     1
-pin1                    res     1
-pin2                    res     1
-pin3                    res     1
-mask0                   res     1
-mask1                   res     1
-mask2                   res     1
-mask3                   res     1
+dataAddr                res     1
+clkAddr                 res     1
+endAddr                 res     1
+dpin0                   res     1
+dpin1                   res     1
+dpin2                   res     1
+dpin3                   res     1
+cpin0                   res     1
+cpin1                   res     1
+cpin2                   res     1
+cpin3                   res     1
+dmask0                  res     1
+dmask1                  res     1
+dmask2                  res     1
+dmask3                  res     1
+cmask0                  res     1
+cmask1                  res     1
+cmask2                  res     1
+cmask3                  res     1
 allmask                 res     1
 start0                  res     1
 start1                  res     1
@@ -219,25 +268,23 @@ len0                    res     1
 len1                    res     1
 len2                    res     1
 len3                    res     1
+endf0                   res     1
+endf1                   res     1
+endf2                   res     1
+endf3                   res     1
 
-' per-refresh working state
-ptr0                    res     1
-ptr1                    res     1
-ptr2                    res     1
-ptr3                    res     1
-byteIdx                 res     1
-maxlen                  res     1
-bitIdx                  res     1
-b0                      res     1
-b1                      res     1
-b2                      res     1
-b3                      res     1
-time                    res     1
-activemask              res     1
-zeromask                res     1
+' per-sendPort working state
+curData                 res     1
+curClk                  res     1
+curPtr                  res     1
+curLen                  res     1
+curEnd                  res     1
+sendCount               res     1
+sendByte                res     1
+remaining               res     1
+bitCnt                  res     1
+ctime                   res     1
 t1                      res     1
 t2                      res     1
-
-resetCyc                long    RESET_CYC               ' initialized value, not res - too big for a #immediate
 
                         fit     496

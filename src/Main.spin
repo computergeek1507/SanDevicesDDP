@@ -10,10 +10,14 @@
   Config.spin / web config page yet (that's plan Step 6). Per-port pixel counts are likewise compile-time
   constants below until then; edit PORT1_PIXELS..PORT4_PIXELS to match your actual strings before flashing.
 
-  NOT YET COMPILED OR TESTED - no Propeller toolchain available in this environment. This is a first-pass
-  integration written directly against the traced E6804 pin table and the vendored W5200 driver's real API
-  (see vendor/W5200_Driver/PROVENANCE.md) - compile with Propeller Tool and bring up cog-by-cog per the plan's
-  verification section before trusting it on a real board.
+  Toolchain in actual use turned out to be FlexProp/flexspin (cross-platform), not the original Windows-only
+  Propeller Tool - make sure it's targeting P1 (Propeller 1 / P8X32A), not its P2 default.
+
+  Status as of the last hardware test: compiles clean, loads to RAM fine, red status LED confirmed lighting up
+  (proves execution reaches past the W5200 setup calls without hanging). Network bring-up (ping test) and the
+  pixel output stage are still being verified - see docs/NOTES.md for the full history. Pixel outputs drive
+  APA102/SK9822-style 2-wire (clock+data) strings, not single-wire WS2811 - confirmed by tracing a dedicated clock
+  pin per port (see docs/pin_mapping_E6804.md).
 }}
 
 CON
@@ -27,6 +31,12 @@ CON
   PIN_PIX_J2     = 4
   PIN_PIX_J3     = 8
   PIN_PIX_J4     = 12
+
+  ' Clock pins for the APA102/SK9822-style 2-wire pixel outputs - see docs/pin_mapping_E6804.md
+  PIN_CLK_J1     = 21
+  PIN_CLK_J2     = 22
+  PIN_CLK_J3     = 20
+  PIN_CLK_J4     = 19
 
   PIN_LED_GREEN  = 16
   PIN_LED_RED    = 17
@@ -76,7 +86,9 @@ VAR
   byte  myip[4]
 
   long  portTable[NUM_PORTS * 2]         ' (startChannel, numBytes) pairs, shared by DDP_Parser and PixelDriver
-  long  pinTable[NUM_PORTS]              ' pixel output pin per port, same order as portTable
+  long  pinTable[NUM_PORTS]              ' pixel data pin per port, same order as portTable
+  long  clockPinTable[NUM_PORTS]         ' pixel clock pin per port (APA102/SK9822 2-wire outputs)
+  long  endFrameBytes[NUM_PORTS]         ' precomputed ceil(pixelCount/16) per port - APA102/SK9822 end-frame length
 
   byte  framebuffer[(PORT1_PIXELS + PORT2_PIXELS + PORT3_PIXELS + PORT4_PIXELS) * 3]
   byte  rxBuf[RX_BUF_SIZE]
@@ -112,6 +124,18 @@ PUB Main | bytesRead, greenState
   pinTable[2] := PIN_PIX_J3
   pinTable[3] := PIN_PIX_J4
 
+  clockPinTable[0] := PIN_CLK_J1
+  clockPinTable[1] := PIN_CLK_J2
+  clockPinTable[2] := PIN_CLK_J3
+  clockPinTable[3] := PIN_CLK_J4
+
+  ' APA102/SK9822 end-frame length: ceil(pixelCount/16) bytes of extra clocking to latch the last pixel through -
+  ' computed here with real division since PASM on the P1 has no divide instruction.
+  endFrameBytes[0] := (PORT1_PIXELS + 15) / 16
+  endFrameBytes[1] := (PORT2_PIXELS + 15) / 16
+  endFrameBytes[2] := (PORT3_PIXELS + 15) / 16
+  endFrameBytes[3] := (PORT4_PIXELS + 15) / 16
+
   portTable[0] := 0                                          ' J1 start channel (byte offset)
   portTable[1] := PORT1_PIXELS * 3                            ' J1 byte length
   portTable[2] := portTable[0] + portTable[1]                 ' J2 start channel
@@ -130,7 +154,7 @@ PUB Main | bytesRead, greenState
   w5200.SocketOpen(0, w5200#_UDPPROTO, ddp#DDP_PORT, 0, 0)
 
   ddp.Start(@framebuffer, @portTable, NUM_PORTS)
-  pixels.Start(@framebuffer, @portTable, @pinTable)
+  pixels.Start(@framebuffer, @portTable, @pinTable, @clockPinTable, @endFrameBytes)
 
   greenState := 0
 

@@ -53,6 +53,47 @@ logical channel space for the whole device; each port owns a contiguous sub-rang
 config model) and a packet can span/overlap multiple ports, so the parser does an interval-overlap copy into each
 port's buffer per packet rather than assuming 1 packet = 1 port.
 
+## Actual toolchain: FlexProp, not Propeller Tool
+
+The bring-up ended up using **FlexProp/flexspin** (Total Spectrum's cross-platform P1/P2 toolchain), not the
+original Windows-only Parallax Propeller Tool assumed earlier in this doc and the plan file. Matters because
+FlexProp defaults to targeting Propeller **2** - for this P8X32A (Propeller 1) board, it must be told to target P1
+explicitly, or you get a wall of P2-flavored syntax errors (e.g. "in P2 temporary labels must start with . rather
+than :") that have nothing to do with the actual source code.
+
+## Bugs found and fixed during first compile/bring-up (2026-09-30/10-01)
+
+- **Spin1's symbol namespace is file-wide, not scoped like most languages.** CON, VAR, OBJ, PUB/PRI names, method
+  parameters, method locals, AND PASM `DAT` labels/`res` variables all share one flat per-file namespace (case-
+  insensitive). Two real bugs from this: `PixelDriver_E6804.spin`'s `Start(fbPtr, portTablePtr, pinsPtr)` parameters
+  collided with identically-named PASM `res` registers in its own `DAT` section (fixed by renaming the PASM-side
+  copies to `fbAddr`/`tblAddr`/`pinAddr`); and `DDP_Parser.spin`'s `VAR packetCount` collided with `PUB
+  PacketCount` purely via case-insensitive matching (fixed by renaming the VAR to `pktCount`). Method
+  parameters/locals ARE properly scoped *against each other* across different methods (confirmed by the vendored
+  W5200 driver reusing `_socket` as a parameter name in ten different methods) - the restriction is specifically
+  against VAR/CON/OBJ/DAT-level global symbols.
+- **`if_nb` is not a real P1 PASM condition mnemonic** (unlike `if_b`, which is) - FlexProp silently treated its
+  first occurrence as a label definition instead of a condition prefix, meaning the guarded instruction was
+  executing unconditionally (a real logic bug, not just a compile error, since only the 2nd+ occurrences actually
+  errored). Fixed by using the base flag-test mnemonic `if_nc` ("if no carry") instead of the `b`/`nb`
+  ("below"/"not below") alias pair - `if_b` by itself was fine, only the "not" form wasn't recognized.
+- **PASM immediates are 9-bit (0-511) only.** `RESET_CYC = 4800` doesn't fit in a `#literal` operand ("Source
+  operand too big for add") - fixed by stashing it in an initialized `DAT` `long` and referencing that directly
+  (no `#`) instead of as an immediate.
+- Compiling a sub-object file directly (e.g. `PixelDriver_E6804.spin` on its own) instead of the top-level
+  `Main.spin` "works" (no error) but does nothing useful - FlexProp just runs that file's first `PUB` as an
+  entry point with garbage arguments. Always compile/upload `Main.spin`.
+
+## Pixel protocol correction: APA102/SK9822, not WS2811
+
+The E6804's output connectors turned out to have a **dedicated clock pin per port** (traced: J1=P21, J2=P22,
+J3=P20, J4=P19, alongside the data pins J1=P0/J2=P4/J3=P8/J4=P12 - see `pin_mapping_E6804.md`), confirming these
+boards drive 2-wire clocked pixel chips (APA102/SK9822), not single-wire WS2811/WS2812 as first assumed.
+`PixelDriver_E6804.spin` was rewritten accordingly. Clocked protocols have no tight pulse-width timing requirement
+(receiver samples on clock edges, not pulse duration), so the rewrite sends all 4 ports sequentially from one cog
+instead of needing WS2811's parallel-lockstep bit-bang technique - simpler code, and still fast enough for a normal
+pixel-display frame rate at a conservative ~1MHz clock pace.
+
 ## Firmware update safety
 
 Before flashing anything custom to a board's own EEPROM: back up the stock firmware first if possible (Propeller
