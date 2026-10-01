@@ -1,0 +1,7 @@
+# FlexProp/FlexSpin build output - generated from the .spin sources, not source itself
+*.binary
+*.pasm
+*.lst
+*.p1
+*.p2
+*.elf
