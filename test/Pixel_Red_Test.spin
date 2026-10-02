@@ -19,7 +19,7 @@ CON
   NUM_PIXELS = 10                        ' how many pixels on J1 to light up
 
 OBJ
-  pixels : "PixelDriver_E6804"
+  pixels : "../src/PixelDriver_E6804"
 
 VAR
   long  portTable[8]
