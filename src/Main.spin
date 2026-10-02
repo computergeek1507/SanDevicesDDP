@@ -51,16 +51,16 @@ CON
   ' W5200 INT is not wired on this board - the vendored driver doesn't use it anyway (polls status via SPI)
 
   ' --- network config (fixed for now - see Config.spin/HTTPServer.spin, plan Step 6, once built) ---
-  ' Default IP matches SanDevices' own stock default (192.168.1.206) so this drops into the same LAN setup
-  ' the stock firmware expected.
+  ' Matches the user's actual LAN (192.168.5.x), not SanDevices' stock 192.168.1.x default - that default only
+  ' works if your LAN happens to use the same subnet, which this one doesn't.
   IP0 = 192
   IP1 = 168
-  IP2 = 1
+  IP2 = 5
   IP3 = 206
 
   GW0 = 192
   GW1 = 168
-  GW2 = 1
+  GW2 = 5
   GW3 = 1
 
   SUB0 = 255
