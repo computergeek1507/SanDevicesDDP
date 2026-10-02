@@ -13,11 +13,12 @@
   Toolchain in actual use turned out to be FlexProp/flexspin (cross-platform), not the original Windows-only
   Propeller Tool - make sure it's targeting P1 (Propeller 1 / P8X32A), not its P2 default.
 
-  Status as of the last hardware test: compiles clean, loads to RAM fine, red status LED confirmed lighting up
-  (proves execution reaches past the W5200 setup calls without hanging). Network bring-up (ping test) and the
-  pixel output stage are still being verified - see docs/NOTES.md for the full history. Pixel outputs drive
-  APA102/SK9822-style 2-wire (clock+data) strings, not single-wire WS2811 - confirmed by tracing a dedicated clock
-  pin per port (see docs/pin_mapping_E6804.md).
+  Status as of the last hardware test: compiles clean, loads to RAM fine, W5200 link/ping/DDP receive path all
+  confirmed working on real hardware (green activity LED toggles on a received DDP packet - see
+  tools/send_test_ddp.py). Pixel output is back to single-wire WS2812/WS2811 for now (PixelDriver_E6804.spin) -
+  the board does have real per-port clock pins traced for APA102/SK9822 2-wire output too (see
+  docs/pin_mapping_E6804.md), but the test strip on hand turned out to be WS2812, so that's what's wired up first.
+  APA102 dual-mode support is tracked as follow-up work once there's real APA102/SK9822 hardware to test against.
 }}
 
 CON
@@ -32,7 +33,9 @@ CON
   PIN_PIX_J3     = 8
   PIN_PIX_J4     = 12
 
-  ' Clock pins for the APA102/SK9822-style 2-wire pixel outputs - see docs/pin_mapping_E6804.md
+  ' Clock pins for the APA102/SK9822-style 2-wire pixel outputs - traced and real (see docs/pin_mapping_E6804.md),
+  ' but not currently used - PixelDriver_E6804.spin is single-wire WS2812/WS2811 for now. Reserved here for the
+  ' planned APA102 dual-mode follow-up.
   PIN_CLK_J1     = 21
   PIN_CLK_J2     = 22
   PIN_CLK_J3     = 20
@@ -89,8 +92,6 @@ VAR
 
   long  portTable[NUM_PORTS * 2]         ' (startChannel, numBytes) pairs, shared by DDP_Parser and PixelDriver
   long  pinTable[NUM_PORTS]              ' pixel data pin per port, same order as portTable
-  long  clockPinTable[NUM_PORTS]         ' pixel clock pin per port (APA102/SK9822 2-wire outputs)
-  long  endFrameBytes[NUM_PORTS]         ' precomputed ceil(pixelCount/16) per port - APA102/SK9822 end-frame length
 
   byte  framebuffer[(PORT1_PIXELS + PORT2_PIXELS + PORT3_PIXELS + PORT4_PIXELS) * 3]
   byte  rxBuf[RX_BUF_SIZE]
@@ -126,18 +127,6 @@ PUB Main | bytesRead, greenState
   pinTable[2] := PIN_PIX_J3
   pinTable[3] := PIN_PIX_J4
 
-  clockPinTable[0] := PIN_CLK_J1
-  clockPinTable[1] := PIN_CLK_J2
-  clockPinTable[2] := PIN_CLK_J3
-  clockPinTable[3] := PIN_CLK_J4
-
-  ' APA102/SK9822 end-frame length: ceil(pixelCount/16) bytes of extra clocking to latch the last pixel through -
-  ' computed here with real division since PASM on the P1 has no divide instruction.
-  endFrameBytes[0] := (PORT1_PIXELS + 15) / 16
-  endFrameBytes[1] := (PORT2_PIXELS + 15) / 16
-  endFrameBytes[2] := (PORT3_PIXELS + 15) / 16
-  endFrameBytes[3] := (PORT4_PIXELS + 15) / 16
-
   portTable[0] := 0                                          ' J1 start channel (byte offset)
   portTable[1] := PORT1_PIXELS * 3                            ' J1 byte length
   portTable[2] := portTable[0] + portTable[1]                 ' J2 start channel
@@ -152,19 +141,11 @@ PUB Main | bytesRead, greenState
   outa[PIN_LED_RED]~~                                         ' solid red = powered/running, matches stock behavior
 
   w5200.start(PIN_W5200_CS, PIN_W5200_SCLK, PIN_W5200_MOSI, PIN_W5200_MISO, PIN_W5200_RST)
-  BlinkCode(1)                                                 ' DIAGNOSTIC: reached here = w5200.start() returned
-
   w5200.InitAddresses(true, @mac, @gateway, @subnet, @myip)
-  BlinkCode(2)                                                 ' DIAGNOSTIC: reached here = InitAddresses() returned
-
   w5200.SocketOpen(0, w5200#_UDPPROTO, ddp#DDP_PORT, 0, 0)
-  BlinkCode(3)                                                 ' DIAGNOSTIC: reached here = SocketOpen() returned
 
   ddp.Start(@framebuffer, @portTable, NUM_PORTS)
-  BlinkCode(4)                                                 ' DIAGNOSTIC: reached here = ddp.Start() returned
-
-  pixels.Start(@framebuffer, @portTable, @pinTable, @clockPinTable, @endFrameBytes)
-  BlinkCode(5)                                                 ' DIAGNOSTIC: reached here = pixels.Start() returned
+  pixels.Start(@framebuffer, @portTable, @pinTable)
 
   greenState := 0
 
@@ -174,14 +155,3 @@ PUB Main | bytesRead, greenState
       if ddp.ProcessPacket(@rxBuf + 8, bytesRead - 8)
         greenState := !greenState
         outa[PIN_LED_GREEN] := greenState                     ' toggles on each accepted DDP frame - activity heartbeat
-
-PRI BlinkCode(n) | i
-'' DIAGNOSTIC ONLY - remove once W5200 bring-up is confirmed working. Blinks the green LED n times (with a longer
-'' pause after) so you can count which startup checkpoint was last reached before a hang, by watching the last
-'' blink-count group that appears.
-  repeat i from 1 to n
-    outa[PIN_LED_GREEN]~~
-    waitcnt(clkfreq / 5 + cnt)
-    outa[PIN_LED_GREEN]~
-    waitcnt(clkfreq / 5 + cnt)
-  waitcnt(clkfreq + cnt)

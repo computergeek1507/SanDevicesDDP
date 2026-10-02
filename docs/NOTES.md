@@ -94,6 +94,19 @@ boards drive 2-wire clocked pixel chips (APA102/SK9822), not single-wire WS2811/
 instead of needing WS2811's parallel-lockstep bit-bang technique - simpler code, and still fast enough for a normal
 pixel-display frame rate at a conservative ~1MHz clock pace.
 
+**Follow-up (2026-10-01): reverted back to single-wire WS2812/WS2811 for now.** The clock pins traced above are
+real and the board genuinely supports driving APA102/SK9822-style 2-wire pixels - but testing the APA102 driver
+against the actual bench pixel strip produced a stuck white/unresponsive LED, and it turned out the test strip was
+WS2812 (single-wire, no clock input at all) the whole time, not APA102/SK9822. A WS2812 LED with nothing valid on
+its single data line commonly defaults to showing white/garbage, which is exactly what was observed - the "bug"
+was a mismatched test setup, not necessarily the APA102 driver logic (that was never actually validated against
+real APA102/SK9822 hardware either way). `PixelDriver_E6804.spin` is back to single-wire WS2812/WS2811 timing
+(800kHz-class, matching WS2812 specifically) so it matches what's actually testable right now. The user wants to
+support both pixel types eventually - planned as a second, separate PASM cog dedicated to APA102/SK9822 ports once
+real APA102/SK9822 hardware is on hand to validate against, rather than merging both protocols' very different
+timing models into one cog. `test/APA102_Pin_Test.spin` (a plain 1Hz GPIO toggle on the data/clock pins, no PASM
+timing involved) is still in the repo as a quick wiring sanity check if pixel output misbehaves again.
+
 ## W5200 bring-up troubleshooting (in progress, 2026-10-01)
 
 `Main.spin` compiles clean, loads to RAM, and the red status LED confirms execution starts. Added green-LED
