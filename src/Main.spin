@@ -150,11 +150,19 @@ PUB Main | bytesRead, greenState
   outa[PIN_LED_RED]~~                                         ' solid red = powered/running, matches stock behavior
 
   w5200.start(PIN_W5200_CS, PIN_W5200_SCLK, PIN_W5200_MOSI, PIN_W5200_MISO, PIN_W5200_RST)
+  BlinkCode(1)                                                 ' DIAGNOSTIC: reached here = w5200.start() returned
+
   w5200.InitAddresses(true, @mac, @gateway, @subnet, @myip)
+  BlinkCode(2)                                                 ' DIAGNOSTIC: reached here = InitAddresses() returned
+
   w5200.SocketOpen(0, w5200#_UDPPROTO, ddp#DDP_PORT, 0, 0)
+  BlinkCode(3)                                                 ' DIAGNOSTIC: reached here = SocketOpen() returned
 
   ddp.Start(@framebuffer, @portTable, NUM_PORTS)
+  BlinkCode(4)                                                 ' DIAGNOSTIC: reached here = ddp.Start() returned
+
   pixels.Start(@framebuffer, @portTable, @pinTable, @clockPinTable, @endFrameBytes)
+  BlinkCode(5)                                                 ' DIAGNOSTIC: reached here = pixels.Start() returned
 
   greenState := 0
 
@@ -164,3 +172,14 @@ PUB Main | bytesRead, greenState
       if ddp.ProcessPacket(@rxBuf + 8, bytesRead - 8)
         greenState := !greenState
         outa[PIN_LED_GREEN] := greenState                     ' toggles on each accepted DDP frame - activity heartbeat
+
+PRI BlinkCode(n) | i
+'' DIAGNOSTIC ONLY - remove once W5200 bring-up is confirmed working. Blinks the green LED n times (with a longer
+'' pause after) so you can count which startup checkpoint was last reached before a hang, by watching the last
+'' blink-count group that appears.
+  repeat i from 1 to n
+    outa[PIN_LED_GREEN]~~
+    waitcnt(clkfreq / 5 + cnt)
+    outa[PIN_LED_GREEN]~
+    waitcnt(clkfreq / 5 + cnt)
+  waitcnt(clkfreq + cnt)
