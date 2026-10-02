@@ -16,11 +16,17 @@
   WS2812 chips expect bytes in GREEN, RED, BLUE order on the wire (not RGB) - this test sends them in that order
   directly, unlike PixelDriver_E6804.spin / DDP_Parser.spin which currently pass bytes through in whatever order
   they're given (a separate, known, not-yet-fixed issue - see docs/NOTES.md).
+
+  Before each pin's test window, the board's red status LED (P17) blinks (pinIdx + 1) times - e.g. 1 blink = P0,
+  5 blinks = P4, 16 blinks = P15 - so you can identify exactly which pin is under test just by counting blinks,
+  without needing to time the cycle precisely.
 }}
 
 CON
   _clkmode = xtal1 + pll16x
   _xinfreq = 5_000_000
+
+  LED_PIN        = 17            ' red status LED, per docs/pin_mapping_E6804.md
 
   ' WS2812/WS2812B (800kHz-class) bit timing at 80MHz core clock - same constants as PixelDriver_E6804.spin
   BIT_PERIOD_CYC = 100
@@ -36,9 +42,29 @@ PUB Main
 DAT
                         org     0
 
-entry                   mov     pinIdx, #0
+entry                   rdlong  sysClk, #0              ' hub address 0 holds CLKFREQ, set by the boot process
+                        mov     blinkDelay, sysClk
+                        shr     blinkDelay, #2          ' sysClk/4 = 0.25s per half-blink (exact, since 4 = 2^2)
+                        mov     pinIdx, #0
 
-pinLoop                 mov     curMask, #1
+pinLoop                 mov     ledMask, #1
+                        shl     ledMask, #LED_PIN
+                        mov     dira, ledMask
+                        mov     outa, #0
+
+                        mov     blinkCnt, pinIdx
+                        add     blinkCnt, #1            ' blink (pinIdx + 1) times - so pin 0 is 1 blink, not 0
+:blinkLoop              or      outa, ledMask
+                        mov     time, cnt
+                        add     time, blinkDelay
+                        waitcnt time, #0
+                        andn    outa, ledMask
+                        mov     time, cnt
+                        add     time, blinkDelay
+                        waitcnt time, #0
+                        djnz    blinkCnt, #:blinkLoop
+
+                        mov     curMask, #1
                         shl     curMask, pinIdx
                         mov     dira, curMask           ' only this pin driven - all others released
                         mov     outa, #0
@@ -85,7 +111,11 @@ clockByte               mov     bitCnt, #8
                         djnz    bitCnt, #:bitloop
 clockByte_ret           ret
 
+sysClk                  res     1
+blinkDelay              res     1
 pinIdx                  res     1
+ledMask                 res     1
+blinkCnt                res     1
 curMask                 res     1
 repCnt                  res     1
 sendByte                res     1
