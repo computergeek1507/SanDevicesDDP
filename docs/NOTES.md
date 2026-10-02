@@ -94,6 +94,28 @@ boards drive 2-wire clocked pixel chips (APA102/SK9822), not single-wire WS2811/
 instead of needing WS2811's parallel-lockstep bit-bang technique - simpler code, and still fast enough for a normal
 pixel-display frame rate at a conservative ~1MHz clock pace.
 
+## W5200 bring-up troubleshooting (in progress, 2026-10-01)
+
+`Main.spin` compiles clean, loads to RAM, and the red status LED confirms execution starts. Added green-LED
+blink-count checkpoints after each startup call (`w5200.start`, `InitAddresses`, `SocketOpen`, `ddp.Start`,
+`pixels.Start`) - **all 5 pass**, meaning every Spin-level call returns without hanging. Despite that, the
+WIZ820IO module's own link LED never lights, even with:
+- Power, cable, and module seating all confirmed good
+- RST pin confirmed at 3.3V (released, not stuck in reset) via multimeter
+- MOSI/MISO swapped as an experiment (no change either way - reverted)
+
+Conclusion so far: the Spin-level "it returned" check doesn't actually prove the W5200 chip responded - the ASM
+driver just fires off SPI commands and trusts they landed, it doesn't verify. So a silent SPI failure (wrong CS or
+SCLK pin, a bad/dead WIZ820IO module, a dead crystal on the module, or a poor connection at the friction-fit socket
+from module age/oxidation) is consistent with everything observed so far. Next experiments to try, cheapest first:
+- Re-seat the WIZ820IO module firmly (friction-fit sockets can lose spring tension / oxidize after a decade)
+- Swap the WIZ820IO module between the E682 and E6804 (both owned) to isolate "bad module" from "bad board
+  socket/tracing" - if the link LED comes up on the other board with the same module, the module's fine and the
+  problem is this board's socket/pins; if it stays dark on both, suspect the module itself
+- Verify 3.3V is actually present at the module's own VCC pin (not just the main board's regulator output),
+  since a cold/oxidized socket pin could pass continuity for a trace (low-current multimeter beep) while still
+  dropping too much to actually power the chip under real current draw
+
 ## Firmware update safety
 
 Before flashing anything custom to a board's own EEPROM: back up the stock firmware first if possible (Propeller
