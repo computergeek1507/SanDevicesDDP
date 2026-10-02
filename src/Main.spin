@@ -41,8 +41,12 @@ CON
   PIN_LED_GREEN  = 16
   PIN_LED_RED    = 17
 
-  PIN_W5200_MISO = 23
-  PIN_W5200_MOSI = 24
+  ' EXPERIMENT: MOSI/MISO swapped from the original trace (P23/P24) to test the hypothesis that they were reversed
+  ' during tracing - all 5 startup checkpoints passed and RST reads 3.3V (released) yet the WIZ820IO shows no link
+  ' LED, which points at a silent SPI communication failure rather than a hang or a stuck reset. Revert to
+  ' MISO=23/MOSI=24 if this doesn't fix it - it wasn't a confirmed mistake, just the most likely one to try first.
+  PIN_W5200_MISO = 24
+  PIN_W5200_MOSI = 23
   PIN_W5200_RST  = 25
   PIN_W5200_CS   = 26
   PIN_W5200_SCLK = 27
