@@ -107,6 +107,22 @@ real APA102/SK9822 hardware is on hand to validate against, rather than merging 
 timing models into one cog. `test/APA102_Pin_Test.spin` (a plain 1Hz GPIO toggle on the data/clock pins, no PASM
 timing involved) is still in the repo as a quick wiring sanity check if pixel output misbehaves again.
 
+**Follow-up (2026-10-01): found and fixed a real timing bug in the 4-port parallel driver.** Even after reverting
+to WS2812, `PixelDriver_E6804.spin` still showed nothing on real hardware, while `test/WS2812_Pin_Scanner.spin` (a
+single-pin version of the same bit-timing technique) correctly lit a WS2812 pixel on P0 - proving the WS2812
+encoding/timing approach itself was sound, and narrowing the bug to something specific about the 4-port parallel
+version. Found it by hand-counting PASM cycles: `bitloop` captured its timing reference (`mov time,cnt`) at the
+TOP of the loop, before computing `activemask`/`zeromask` across all 4 ports (8 conditional cmp/test instructions,
+~60+ cycles) - so by the time execution reached the first `waitcnt`, real elapsed time had already blown past the
+intended T0H deadline (32 cycles), making `waitcnt` return immediately instead of waiting. Every bit (whether
+nominally 0 or 1) ended up looking like an overlong high pulse (~250ns late drop) to the WS2812, which would
+reliably produce invalid/rejected data rather than any visible color - consistent with "completely dark,
+no color at all" being observed even on a successful DDP packet or a hardcoded red test. Fixed by moving the
+`activemask`/`zeromask` computation BEFORE capturing the timing reference, so `time := cnt` happens immediately
+before the pin actually goes high - matching exactly how the proven-working single-pin scanner is structured.
+Lesson: in PASM timing loops, capture your `cnt` reference as close as possible to the action being timed, after
+all variable-cost preparatory work, not before it.
+
 ## W5200 bring-up troubleshooting (in progress, 2026-10-01)
 
 `Main.spin` compiles clean, loads to RAM, and the red status LED confirms execution starts. Added green-LED

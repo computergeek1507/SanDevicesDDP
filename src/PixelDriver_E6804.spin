@@ -144,10 +144,7 @@ byteloop                cmp     byteIdx, len0     wc
 
                         mov     bitIdx, #8
 
-bitloop                 mov     time, cnt
-                        add     time, #40               ' small lead-in before first waitcnt
-
-                        mov     activemask, #0
+bitloop                 mov     activemask, #0
                         cmp     byteIdx, len0     wc
               if_b      or      activemask, mask0
                         cmp     byteIdx, len1     wc
@@ -156,8 +153,6 @@ bitloop                 mov     time, cnt
               if_b      or      activemask, mask2
                         cmp     byteIdx, len3     wc
               if_b      or      activemask, mask3
-
-                        or      outa, activemask       ' t=0: all active pins go high together
 
                         mov     zeromask, #0
                         test    b0, #%1000_0000   wz
@@ -168,6 +163,15 @@ bitloop                 mov     time, cnt
               if_z      or      zeromask, mask2
                         test    b3, #%1000_0000   wz
               if_z      or      zeromask, mask3
+
+                        ' Timing reference is captured HERE, right before actually going high - not at the top of
+                        ' this loop - because the port-checking work above (8 conditional cmp/test instructions)
+                        ' takes ~60+ cycles, which blew past the T0H deadline if "time" was set before doing it
+                        ' (a real bug found during hardware bring-up: every bit looked like an overlong high pulse
+                        ' to the WS2812, since T0H fired ~250ns late - see docs/NOTES.md).
+                        mov     time, cnt
+                        add     time, #40               ' small lead-in before first waitcnt
+                        or      outa, activemask       ' t=0: all active pins go high together
 
                         add     time, #T0H_CYC
                         waitcnt time, #0
