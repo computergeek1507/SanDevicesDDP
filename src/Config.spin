@@ -1,8 +1,9 @@
 {{
   Config.spin
 
-  EEPROM-backed persistent configuration: network settings (IP/gateway/subnet) and per-port pixel counts. MAC and
-  the DDP listen port are NOT configurable (per user decision - stay fixed, set directly in Main.spin).
+  EEPROM-backed persistent configuration: network settings (IP/gateway/subnet), per-port pixel counts, and
+  per-port pixel output settings (color order, brightness, start nulls, pixel group size). MAC and the DDP listen
+  port are NOT configurable (per user decision - stay fixed, set directly in Main.spin).
 
   Stored as one flat byte array with explicit offset constants below - deliberately NOT a typed VAR struct
   (long/word/byte fields mixed together). An earlier version used a typed struct on the assumption that Spin1
@@ -16,20 +17,35 @@
   (I2C pins SCL=P28/SDA=P29, standard device address - see docs/pin_mapping_E6804.md) - that offset is safely
   above the full 32KB P1 boot image (confirmed by compiling to .eeprom format, which always pads to exactly 32768
   bytes), stays inside the same 64KB I2C addressing block as the boot image (no block-select bit needed), and is
-  page-aligned (32768 = 128*256), so the whole block fits in a single EEPROM page.
+  page-aligned (32768 = 128*256), so the whole block fits in a single EEPROM page (47 bytes, well under 256).
 
   Field layout (byte offsets into `block`):
-    0   long  magic         $53444450 ("SDDP")
-    4   byte  version       1
+    0   long  magic             $53444450 ("SDDP")
+    4   byte  version           1
     5   byte  ip[4]
     9   byte  gateway[4]
     13  byte  subnet[4]
-    17  word  port1Pixels   (big-endian: high byte first)
+    17  word  port1Pixels       (big-endian: high byte first)
     19  word  port2Pixels
     21  word  port3Pixels
     23  word  port4Pixels
-    25  byte  reserved[7]
-    32  word  checksum      16-bit additive sum of bytes 0..31
+    25  byte  port1ColorOrder   0-5: 0=RGB 1=RBG 2=GRB 3=GBR 4=BRG 5=BGR
+    26  byte  port1Brightness   0-100 (percent)
+    27  word  port1StartNulls   0-MAX_PIXELS_PER_PORT (pixels, not bytes)
+    29  byte  port1GroupSize    1-10
+    30  byte  port2ColorOrder
+    31  byte  port2Brightness
+    32  word  port2StartNulls
+    34  byte  port2GroupSize
+    35  byte  port3ColorOrder
+    36  byte  port3Brightness
+    37  word  port3StartNulls
+    39  byte  port3GroupSize
+    40  byte  port4ColorOrder
+    41  byte  port4Brightness
+    42  word  port4StartNulls
+    44  byte  port4GroupSize
+    45  word  checksum          16-bit additive sum of bytes 0..44
 
   A blank/never-written EEPROM reads all $FF, which fails the magic check immediately and falls straight through
   to LoadDefaults - satisfying "still runs correctly on missing/corrupt config" with no special-case code.
@@ -46,20 +62,39 @@ CON
                                ' proves this is correct, since the Propeller's own boot ROM uses the same address)
 
   MAX_PIXELS_PER_PORT = 300   ' see docs/NOTES.md for the hub-RAM budget this is based on
+  MAX_COLOR_ORDER      = 5    ' 0=RGB 1=RBG 2=GRB 3=GBR 4=BRG 5=BGR
+  MAX_BRIGHTNESS       = 100  ' percent
+  MAX_START_NULLS      = 300  ' reuses MAX_PIXELS_PER_PORT's value - no reason nulls should exceed the same budget
+  MAX_GROUP_SIZE       = 10
 
   ' byte offsets into `block` - see field layout table above
-  OFS_MAGIC    = 0
-  OFS_VERSION  = 4
-  OFS_IP       = 5
-  OFS_GATEWAY  = 9
-  OFS_SUBNET   = 13
-  OFS_PORT1    = 17
-  OFS_PORT2    = 19
-  OFS_PORT3    = 21
-  OFS_PORT4    = 23
-  OFS_RESERVED = 25
-  OFS_CHECKSUM = 32
-  BLOCK_SIZE   = 34
+  OFS_MAGIC       = 0
+  OFS_VERSION     = 4
+  OFS_IP          = 5
+  OFS_GATEWAY     = 9
+  OFS_SUBNET      = 13
+  OFS_PORT1       = 17
+  OFS_PORT2       = 19
+  OFS_PORT3       = 21
+  OFS_PORT4       = 23
+  OFS_PORT1_CO    = 25
+  OFS_PORT1_BR    = 26
+  OFS_PORT1_NU    = 27
+  OFS_PORT1_GR    = 29
+  OFS_PORT2_CO    = 30
+  OFS_PORT2_BR    = 31
+  OFS_PORT2_NU    = 32
+  OFS_PORT2_GR    = 34
+  OFS_PORT3_CO    = 35
+  OFS_PORT3_BR    = 36
+  OFS_PORT3_NU    = 37
+  OFS_PORT3_GR    = 39
+  OFS_PORT4_CO    = 40
+  OFS_PORT4_BR    = 41
+  OFS_PORT4_NU    = 42
+  OFS_PORT4_GR    = 44
+  OFS_CHECKSUM    = 45
+  BLOCK_SIZE      = 47
 
 VAR
   byte block[BLOCK_SIZE]
@@ -79,7 +114,8 @@ PUB Load : valid
     valid := false
 
 PUB LoadDefaults
-'' The same values that used to be fixed CON constants directly in Main.spin.
+'' The same values that used to be fixed CON constants directly in Main.spin. Pixel output settings default to
+'' "no-op" values: RGB order, full brightness, no nulls, group size 1 - matching today's unmodified pass-through.
   SetLong(OFS_MAGIC, CFG_MAGIC)
   block[OFS_VERSION] := CFG_VERSION
 
@@ -103,7 +139,25 @@ PUB LoadDefaults
   SetWord(OFS_PORT3, 50)
   SetWord(OFS_PORT4, 50)
 
-  bytefill(@block[OFS_RESERVED], 0, 7)
+  block[OFS_PORT1_CO] := 0
+  block[OFS_PORT1_BR] := 100
+  SetWord(OFS_PORT1_NU, 0)
+  block[OFS_PORT1_GR] := 1
+
+  block[OFS_PORT2_CO] := 0
+  block[OFS_PORT2_BR] := 100
+  SetWord(OFS_PORT2_NU, 0)
+  block[OFS_PORT2_GR] := 1
+
+  block[OFS_PORT3_CO] := 0
+  block[OFS_PORT3_BR] := 100
+  SetWord(OFS_PORT3_NU, 0)
+  block[OFS_PORT3_GR] := 1
+
+  block[OFS_PORT4_CO] := 0
+  block[OFS_PORT4_BR] := 100
+  SetWord(OFS_PORT4_NU, 0)
+  block[OFS_PORT4_GR] := 1
 
   SetWord(OFS_CHECKSUM, computeChecksum)
 
@@ -139,6 +193,54 @@ PUB GetPort3Pixels
 PUB GetPort4Pixels
   return GetWord(OFS_PORT4)
 
+PUB GetPort1ColorOrder
+  return block[OFS_PORT1_CO]
+
+PUB GetPort2ColorOrder
+  return block[OFS_PORT2_CO]
+
+PUB GetPort3ColorOrder
+  return block[OFS_PORT3_CO]
+
+PUB GetPort4ColorOrder
+  return block[OFS_PORT4_CO]
+
+PUB GetPort1Brightness
+  return block[OFS_PORT1_BR]
+
+PUB GetPort2Brightness
+  return block[OFS_PORT2_BR]
+
+PUB GetPort3Brightness
+  return block[OFS_PORT3_BR]
+
+PUB GetPort4Brightness
+  return block[OFS_PORT4_BR]
+
+PUB GetPort1StartNulls
+  return GetWord(OFS_PORT1_NU)
+
+PUB GetPort2StartNulls
+  return GetWord(OFS_PORT2_NU)
+
+PUB GetPort3StartNulls
+  return GetWord(OFS_PORT3_NU)
+
+PUB GetPort4StartNulls
+  return GetWord(OFS_PORT4_NU)
+
+PUB GetPort1GroupSize
+  return block[OFS_PORT1_GR]
+
+PUB GetPort2GroupSize
+  return block[OFS_PORT2_GR]
+
+PUB GetPort3GroupSize
+  return block[OFS_PORT3_GR]
+
+PUB GetPort4GroupSize
+  return block[OFS_PORT4_GR]
+
 ' --- validating setters: the only way external callers (HTTPServer, via Main.spin) are allowed to touch fields,
 ' so bad/out-of-range form input can never reach the shared struct un-clamped ---
 
@@ -171,6 +273,54 @@ PUB SetPort3Pixels(n)
 
 PUB SetPort4Pixels(n)
   SetWord(OFS_PORT4, (0 #> n) <# MAX_PIXELS_PER_PORT)
+
+PUB SetPort1ColorOrder(n)
+  block[OFS_PORT1_CO] := (0 #> n) <# MAX_COLOR_ORDER
+
+PUB SetPort2ColorOrder(n)
+  block[OFS_PORT2_CO] := (0 #> n) <# MAX_COLOR_ORDER
+
+PUB SetPort3ColorOrder(n)
+  block[OFS_PORT3_CO] := (0 #> n) <# MAX_COLOR_ORDER
+
+PUB SetPort4ColorOrder(n)
+  block[OFS_PORT4_CO] := (0 #> n) <# MAX_COLOR_ORDER
+
+PUB SetPort1Brightness(n)
+  block[OFS_PORT1_BR] := (0 #> n) <# MAX_BRIGHTNESS
+
+PUB SetPort2Brightness(n)
+  block[OFS_PORT2_BR] := (0 #> n) <# MAX_BRIGHTNESS
+
+PUB SetPort3Brightness(n)
+  block[OFS_PORT3_BR] := (0 #> n) <# MAX_BRIGHTNESS
+
+PUB SetPort4Brightness(n)
+  block[OFS_PORT4_BR] := (0 #> n) <# MAX_BRIGHTNESS
+
+PUB SetPort1StartNulls(n)
+  SetWord(OFS_PORT1_NU, (0 #> n) <# MAX_START_NULLS)
+
+PUB SetPort2StartNulls(n)
+  SetWord(OFS_PORT2_NU, (0 #> n) <# MAX_START_NULLS)
+
+PUB SetPort3StartNulls(n)
+  SetWord(OFS_PORT3_NU, (0 #> n) <# MAX_START_NULLS)
+
+PUB SetPort4StartNulls(n)
+  SetWord(OFS_PORT4_NU, (0 #> n) <# MAX_START_NULLS)
+
+PUB SetPort1GroupSize(n)
+  block[OFS_PORT1_GR] := (1 #> n) <# MAX_GROUP_SIZE
+
+PUB SetPort2GroupSize(n)
+  block[OFS_PORT2_GR] := (1 #> n) <# MAX_GROUP_SIZE
+
+PUB SetPort3GroupSize(n)
+  block[OFS_PORT3_GR] := (1 #> n) <# MAX_GROUP_SIZE
+
+PUB SetPort4GroupSize(n)
+  block[OFS_PORT4_GR] := (1 #> n) <# MAX_GROUP_SIZE
 
 PRI GetLong(ofs) : v
   v := (block[ofs] << 24) | (block[ofs+1] << 16) | (block[ofs+2] << 8) | block[ofs+3]

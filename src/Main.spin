@@ -159,11 +159,17 @@ PUB Main | bytesRead, greenState
 
     PollHTTP
 
-PRI PollHTTP | n, bodyPtr, bodyLen, parsedIP[4], parsedGW[4], parsedSN[4], p1, p2, p3, p4, respLen
+PRI PollHTTP | n, bodyPtr, bodyLen, parsedIP[4], parsedGW[4], parsedSN[4], oldIP[4], oldGW[4], oldSN[4], p1, p2, p3, p4, respLen, saveOk, netChanged, idx
 '' Non-blocking - called once per main loop iteration alongside the UDP/DDP polling above, same cog, no mutex
 '' needed (HTTPServer.spin owns no socket of its own - see its header comment). A GET always gets served the
-'' current config form; a POST applies+saves it and REBOOTs so W5200/pixel driver/port table all restart cleanly
-'' with the new values instead of trying to live-reinitialize an already-running system.
+'' current config form; a POST applies+saves it live (see ApplyLiveConfig) - NOT via REBOOT. A Propeller-only
+'' REBOOT was tried first and found unreliable on real hardware: the W5200 repeatedly failed to come back up
+'' afterward (confirmed NOT an Ethernet auto-negotiation timing issue - needed a full board power cycle to
+'' recover, not just patience - and reproduced even with the W5200 driver in total isolation, no HTTP/Config
+'' involved at all) - see docs/NOTES.md. Live reinit avoids the problem entirely: pixel-count changes only need
+'' PixelDriver_E6804's cog restarted (DDP_Parser re-reads portTable's cells in place, no restart needed there),
+'' and network-address changes use W5200_Driver's existing WriteIPaddress/WriteGatewayAddress/WriteSubnetMask
+'' methods to update the already-running chip with no reset at all.
   case httpState
     ST_LISTEN:
       if w5200.SocketTCPestablished(1)
@@ -191,10 +197,15 @@ PRI PollHTTP | n, bodyPtr, bodyLen, parsedIP[4], parsedGW[4], parsedSN[4], p1, p
         bodyPtr := @httpBuf + httpHeaderEnd
         bodyLen := httpReqLen - httpHeaderEnd
 
-        ' pre-fill with current values so a field the form didn't submit keeps its existing value
-        bytemove(@parsedIP, config.GetIPPtr, 4)
-        bytemove(@parsedGW, config.GetGatewayPtr, 4)
-        bytemove(@parsedSN, config.GetSubnetPtr, 4)
+        ' snapshot current values first - both to pre-fill fields the form didn't submit, AND to detect
+        ' afterward whether network settings actually changed (only THAT needs the W5200 reset/reinit below -
+        ' a pixel-count-only save should stay exactly as disruption-free as it already is)
+        bytemove(@oldIP, config.GetIPPtr, 4)
+        bytemove(@oldGW, config.GetGatewayPtr, 4)
+        bytemove(@oldSN, config.GetSubnetPtr, 4)
+        bytemove(@parsedIP, @oldIP, 4)
+        bytemove(@parsedGW, @oldGW, 4)
+        bytemove(@parsedSN, @oldSN, 4)
         p1 := config.GetPort1Pixels
         p2 := config.GetPort2Pixels
         p3 := config.GetPort3Pixels
@@ -209,17 +220,56 @@ PRI PollHTTP | n, bodyPtr, bodyLen, parsedIP[4], parsedGW[4], parsedSN[4], p1, p
         config.SetPort2Pixels(p2)
         config.SetPort3Pixels(p3)
         config.SetPort4Pixels(p4)
-        config.Save
+        saveOk := config.Save                                 ' checked, not discarded - see HTTPServer.BuildSavedPage
 
-        respLen := httpServer.BuildSavedPage(@httpBuf)
+        netChanged := false
+        repeat idx from 0 to 3
+          if oldIP[idx] <> parsedIP[idx] or oldGW[idx] <> parsedGW[idx] or oldSN[idx] <> parsedSN[idx]
+            netChanged := true
+
+        respLen := httpServer.BuildSavedPage(@httpBuf, saveOk, netChanged)
         w5200.txTCP(1, @httpBuf, respLen)
-        waitcnt(clkfreq / 2 + cnt)                            ' give the W5200 time to actually queue the response
-                                                                ' for send before the chip goes away
-        REBOOT
+
+        ApplyLiveConfig(netChanged)
+        ResetHTTPSocket
       else
         respLen := httpServer.BuildFormPage(@httpBuf, config.GetIPPtr, config.GetGatewayPtr, config.GetSubnetPtr, config.GetPort1Pixels, config.GetPort2Pixels, config.GetPort3Pixels, config.GetPort4Pixels)
         w5200.txTCP(1, @httpBuf, respLen)
         ResetHTTPSocket
+
+PRI ApplyLiveConfig(netChanged)
+'' Restarts PixelDriver_E6804 with a freshly-recomputed port table (its PASM cog reads start/len values from hub
+'' RAM exactly once at startup, per its own header comment - just updating portTable's cells in place does nothing
+'' to an already-running cog). DDP_Parser doesn't need restarting: it re-reads portTable's cells fresh on every
+'' ProcessPacket call, so updating the array in place is enough. Always done, regardless of netChanged.
+''
+'' IP/gateway/subnet changes (only when netChanged - a pixel-count-only save stays exactly as disruption-free as
+'' it already is) use ResetSoftware (writes the W5200's Mode Register reset bit over SPI - no external RST pin
+'' involved, Propeller never reboots) + InitAddresses + reopening socket 0, confirmed reliable on real hardware via
+'' test/W5200_SoftReset_Test.spin (repeated indefinitely, ping kept working throughout - see docs/NOTES.md).
+'' This replaced an earlier attempt that called WriteIPaddress/WriteGatewayAddress/WriteSubnetMask directly while
+'' the W5200 cog was already busy servicing live sockets - those block with (now-fixed, but then-infinite) no
+'' timeout and hung the entire firmware, not just HTTP (see docs/NOTES.md). Socket 1 (HTTP) doesn't need handling
+'' here even though the reset wipes it too - the caller's ResetHTTPSocket call right after this one already
+'' unconditionally reopens it.
+  pixels.Stop
+
+  portTable[0] := 0
+  portTable[1] := config.GetPort1Pixels * 3
+  portTable[2] := portTable[0] + portTable[1]
+  portTable[3] := config.GetPort2Pixels * 3
+  portTable[4] := portTable[2] + portTable[3]
+  portTable[5] := config.GetPort3Pixels * 3
+  portTable[6] := portTable[4] + portTable[5]
+  portTable[7] := config.GetPort4Pixels * 3
+
+  pixels.Start(@framebuffer, @portTable, @pinTable)
+
+  if netChanged
+    w5200.SocketClose(0)
+    w5200.ResetSoftware(true)
+    w5200.InitAddresses(true, @mac, config.GetGatewayPtr, config.GetSubnetPtr, config.GetIPPtr)
+    w5200.SocketOpen(0, w5200#_UDPPROTO, ddp#DDP_PORT, 0, 0)
 
 PRI ResetHTTPSocket
   w5200.SocketTCPdisconnect(1)

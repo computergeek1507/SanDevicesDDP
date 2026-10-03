@@ -328,11 +328,138 @@ its last action (that's the point of the test) - so the NEXT thing flashed (`Mai
 "invalid" and boot from hardcoded defaults the first time, not because of a bug but because the test intentionally
 left the stored config corrupted. Expected, not a regression.
 
-**Still not yet done**: the full `Main.spin` GET/POST/reboot flow (load the config page, confirm it shows clean
-defaults - 192.168.5.206 / gateway 192.168.5.1 / subnet 255.255.255.0 / 50-50-50-50 pixels - submit a change,
-confirm it saves+reboots+persists). Given this project's own history of a false "it worked" report costing real
-debugging time (see the WS2812 entries above), don't update README's status table to "Done" based on isolated
-tests alone - confirm the full checklist in the plan file
+**Found on real hardware (2026-10-02): two more real issues in the GET/POST/reboot flow.** First end-to-end test of
+the Save path: loading the page and submitting a pixel-count change (only pixel counts edited, IP/gateway/subnet
+left as shown) produced the "Saved, rebooting" page and a visible reboot (red LED off-then-on), but afterward the
+board was completely unreachable - no ping, no DDP response, green activity LED never toggled even once. A full
+power cycle (not just waiting - tried 30s with no power cycle first, no change) recovered it. After recovery, the
+config page loaded fine but showed the pixel count back at the default (50), not the value that had been saved and
+"confirmed" - meaning the EEPROM write itself didn't actually persist either.
+
+Two separate problems, not one:
+
+1. **W5200 doesn't reliably come back after a Propeller-only warm reboot** (`REBOOT`, not a board power cycle).
+   Ruled out Ethernet auto-negotiation time as the cause (cable was connected throughout, and 30s is far more than
+   enough for a real link to come up - this needed a full power cycle, not patience). Most likely cause: the W5200
+   reset pulse width (`_rstTime` in `src/W5200_Driver.spin`, used to toggle the chip's RSTn pin during
+   `w5200.start()`) was only 200 cycles (2.5us) - plausibly adequate when the chip's own power-on-reset circuit is
+   also helping during a true cold power-up, but not a reliable way to force a full reset on a chip that's already
+   running with established state, which is exactly the situation on a warm Propeller reboot with the W5200 never
+   losing power. **Widened `_rstTime` to 80,000 cycles (1ms) - a 400x margin increase, essentially free given the
+   driver already waits 200ms after the pulse regardless.** Not yet re-tested on hardware.
+
+2. **The EEPROM save during that same test didn't actually persist** (page showed default 50, not the saved 75,
+   after recovery) - a different bug from the VAR-packing issue fixed earlier (that was fully re-tested and
+   confirmed fixed via `Config_Load_Save_Test.spin` BEFORE this test, in a from-scratch isolated test, not inside
+   the live HTTP flow). `config.Save`'s return value was never checked in `Main.spin` - if the EEPROM write
+   genuinely failed (or the ACK-poll gave up), the page would still claim success. Added real success/failure
+   reporting: `HTTPServer.BuildSavedPage` now takes `saveOk` (from `config.Save`'s actual return value) and shows
+   "SAVE FAILED" instead of "Saved" if the write didn't succeed - so the next test will say definitively whether
+   `Save()` itself is failing, rather than needing another guess. Root cause of the persistence failure itself is
+   not yet identified - worth considering whether it's related to issue 1 (e.g. some shared resource/timing
+   effect between the W5200 cog and the plain-Spin I2C calls specifically during this live flow, not reproduced by
+   the isolated Config_Load_Save_Test) if the "SAVE FAILED" message doesn't show up on the next test (i.e. if
+   `Save()` reports success but the value still doesn't survive a reboot).
+
+**Widening `_rstTime` did not fix it (2026-10-03).** Re-tested with the 400x-wider reset pulse in place: same
+symptom (solid red, green never toggles, no ping/DDP, needs a full power cycle). Built `test/W5200_Reboot_Test.spin`
+to isolate the question further - plain UDP only, no TCP/HTTP/Config at all, just `w5200.start`/`InitAddresses`/
+`SocketOpen` then `REBOOT` in a loop. Result: **erratic, not deterministically broken** - first cycle's green-LED
+"about to reboot" blink sequence (3 blinks) completed fully, but the second cycle only got through 1 blink before
+going dark and never recovering. A non-deterministic, partial-progress failure pattern like this (not "always
+fails the same way") points at something electrical/marginal - a brief pin-state glitch when a fresh cog starts,
+a power-rail dip during the Propeller's own reset event, or settling time - rather than a clean software logic bug
+reachable by reading code. Confirmed this reproduces with ZERO HTTP/Config code involved, so it was never about
+the Save flow specifically - it's REBOOT-plus-W5200 in general on this board.
+
+**Architecture change (2026-10-03): dropped `REBOOT` from the config-save path entirely, in favor of live
+reinitialization.** Given the reboot-reliability problem resisted two real fix attempts and showed non-deterministic
+symptoms (the kind of thing that's very hard to fully rule out via more software tweaks without a scope/logic
+analyzer on the actual board), the more robust fix is to avoid the fragile path altogether rather than keep
+chasing it blind. `Main.spin`'s `ApplyLiveConfig` (new) now does, with no reboot at all:
+- Pixel count changes: `pixels.Stop` + recompute `portTable` + `pixels.Start` - the only reason a restart is
+  needed at all, confirmed earlier, is that `PixelDriver_E6804`'s PASM cog reads `portTable`/`pinTable` from hub
+  RAM exactly once at `entry` and never again. `DDP_Parser` needs no restart - it re-reads `portTable`'s cells
+  fresh on every `ProcessPacket` call, so updating the array in place is enough.
+- IP/gateway/subnet changes: `W5200_Driver.spin`'s existing `WriteIPaddress`/`WriteGatewayAddress`/
+  `WriteSubnetMask` methods write directly to the already-running chip's registers over SPI, no reset needed -
+  these already existed in the vendored driver and were simply unused until now.
+
+`test/Reboot_Smoke_Test.spin` and `test/W5200_Reboot_Test.spin` are kept as standalone diagnostic artifacts (the
+first confirms `REBOOT` itself is a real, correct P1 reset mechanism; the second documents the specific W5200
+unreliability finding) even though the real firmware no longer uses `REBOOT` anywhere.
+
+**Found on real hardware (2026-10-03): the live-reinit W5200 address writes hung the whole firmware.** First test
+of the no-REBOOT live-reinit path: GET loaded the page fine, but after submitting Save, the board became
+completely unresponsive - not just HTTP, DDP stopped responding too (needed a power cycle to recover). This is
+consistent with `W5200_Driver.spin`'s `WriteIPaddress`/`WriteGatewayAddress`/`WriteSubnetMask` blocking forever:
+they do `command := ...` then `repeat while command` with **no timeout**, waiting for the W5200's own SPI cog to
+service the request. Those specific commands had only ever been exercised once before, immediately after
+`w5200.start()`, when that cog has nothing else going on - this was the first time they were called while the cog
+was already busy servicing live sockets, and apparently it doesn't pick them up promptly (or at all) in that
+context. Since Main's single cog does everything (DDP polling, HTTP polling), a stuck wait there freezes the
+entire firmware, not just the HTTP response.
+
+**Fix: dropped the live W5200 address writes entirely, kept only the pixel-count live-restart.** `ApplyLiveConfig`
+now only does `pixels.Stop`/recompute `portTable`/`pixels.Start` - no W5200 calls at all after boot. IP/gateway/
+subnet changes still get saved to EEPROM by `config.Save` (that part doesn't touch the W5200), but only take
+effect on the next reboot/power-cycle, not immediately - `HTTPServer`'s "Saved" page now says so explicitly. Pixel
+count changes should still apply immediately with no reboot needed. The root cause of why those three commands
+don't get serviced promptly by the running W5200 cog is not understood yet - worth real investigation (reading the
+ASM command-dispatch loop in `W5200_Driver.spin`, or testing in isolation with a bounded/non-blocking wait) before
+ever trying to make IP/gateway/subnet changes apply live again.
+
+**Confirmed (2026-10-03): the narrower live-reinit (pixel counts only, no W5200 calls) works on real hardware.**
+Submitted a pixel-count change via the web page - no hang, DDP kept responding, and a DDP test packet confirmed the
+new pixel count took effect immediately with no reboot/power-cycle needed. This is the first time the Save path has
+actually worked end-to-end on real hardware.
+
+Minor, separate, low-priority issue noted: the very first page load right after flashing/boot needs a manual
+browser refresh to succeed (subsequent loads are fine). Not yet investigated - plausibly the TCP listen socket
+isn't quite ready to accept a connection in the first moment after `w5200.start()`'s settle time, and the browser
+doesn't auto-retry a refused/dropped first attempt the way it does e.g. a DNS failure. Low priority since it
+self-resolves with one refresh and doesn't affect any real functionality once past it.
+
+**Investigating live IP/gateway/subnet changes (2026-10-03), prompted by the user noting the stock SanDevices
+firmware can change IP live with no power cycle - so this should be achievable, not a hardware limitation.** Found
+`W5200_Driver.spin` already has `ResetSoftware` (writes the W5200's Mode Register reset bit over SPI - no external
+RST pin involved at all), vendored but never used. This is a promising alternative to the hardware-pin-based reset
+path that failed under `REBOOT`, since it never touches the Propeller's own reset state at all.
+
+Before relying on it: hardened ALL SIX command-dispatch methods that share the `command := ...` / `repeat while
+command` pattern (`WriteMACaddress`, `WriteGatewayAddress`, `WriteSubnetMask`, `WriteIPaddress`, `ResetHardware`,
+`ResetSoftware`) with a bounded 2-second timeout instead of an infinite wait - this is what's suspected to have
+hung the whole firmware when `WriteIPaddress` was called live for the first time (see above). Low-risk, applies
+everywhere this pattern appears, doesn't change behavior in the success case.
+
+Built `test/W5200_SoftReset_Test.spin` to validate before touching `Main.spin` again (given the track record of two
+real hangs from live W5200 calls): brings up the W5200 normally, then in a loop - WITHOUT ever rebooting the
+Propeller - closes the UDP socket, calls `ResetSoftware`, re-runs `InitAddresses`, reopens the socket, and blinks
+the green LED 5x as a "survived a cycle" marker. Not yet run on hardware.
+
+**Confirmed (2026-10-03): `test/W5200_SoftReset_Test.spin` passed - the 5-blink pattern repeated indefinitely and
+ping kept working throughout**, with the Propeller never rebooting at all. This matches the original SanDevices
+stock firmware's ability to change IP live with no power cycle, and confirms it's achievable here too - the earlier
+`REBOOT`-based unreliability was specific to resetting the Propeller chip itself (and/or the hardware RST pin
+path), not an inherent limitation of live-updating the W5200.
+
+**Wired into `Main.spin`**: `ApplyLiveConfig` now takes a `netChanged` flag (computed by comparing the submitted
+IP/gateway/subnet against the pre-save values, byte by byte). Pixel-count changes always restart just the pixel
+driver cog, as before. IP/gateway/subnet changes additionally do `SocketClose(0)` -> `ResetSoftware` ->
+`InitAddresses` -> `SocketOpen(0)` - but ONLY when those fields actually changed, so a pixel-count-only save stays
+exactly as disruption-free as it already was. Socket 1 (HTTP) doesn't need explicit handling in `ApplyLiveConfig`
+even though a reset wipes it too - the caller's existing `ResetHTTPSocket` call right after unconditionally
+reopens it regardless of whether a reset happened. `HTTPServer.BuildSavedPage` now also takes `netChanged` and
+tells the user whether a brief network reset happened or not.
+
+**Still not yet done**: the actual hardware test of this wired-in version - submit an IP/gateway/subnet change via
+the real config page (not the isolated test) and confirm it applies live with no power-cycle, confirm a
+pixel-count-only save still shows zero disruption (no reset happens), and confirm the saved pixel count survives
+an actual power cycle (proving EEPROM persistence, not just the live-apply behavior). Also still pending: confirm
+a blank/corrupt EEPROM still falls back to defaults in the full `Main.spin` context; confirm clamping rejects an
+out-of-range submitted value (e.g. pixel count 99999). Given this project's own history of a false "it worked"
+report costing real debugging time (see the WS2812 entries above), don't update README's status table to "Done"
+based on partial verification alone - confirm the full checklist in the plan file
 (`C:\Users\scoot\.claude\plans\humble-leaping-hamster.md`) on real hardware first.
 
 ## Firmware update safety

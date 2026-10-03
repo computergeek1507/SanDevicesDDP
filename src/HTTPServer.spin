@@ -100,10 +100,22 @@ PUB BuildFormPage(destPtr, ipPtr, gwPtr, snPtr, p1, p2, p3, p4) : len
   AppendStr(string("<p><input type=submit value=Save></p></form></body></html>"))
   return cursor
 
-PUB BuildSavedPage(destPtr) : len
+PUB BuildSavedPage(destPtr, saveOk, netChanged) : len
+'' saveOk should be Config.Save's actual return value - shown explicitly rather than always claiming success, so a
+'' real EEPROM write failure (e.g. the chip not ACKing) is visible on the page instead of silently looking fine.
+'' netChanged reflects whether IP/gateway/subnet actually changed in this submission - only then does the network
+'' briefly reset (see Main.ApplyLiveConfig); worth saying so since a pixel-count-only save has zero disruption.
   BeginBuild(destPtr)
   AppendStr(string("HTTP/1.0 200 OK", 13, 10, "Content-Type: text/html", 13, 10, "Connection: close", 13, 10, 13, 10))
-  AppendStr(string("<html><body><h1>Saved</h1><p>Rebooting - reload this page in a few seconds.</p></body></html>"))
+  if saveOk
+    AppendStr(string("<html><body><h1>Saved</h1><p>Applied live - pixel counts always; "))
+    if netChanged
+      AppendStr(string("network settings too (brief reset, no reboot needed)."))
+    else
+      AppendStr(string("network settings unchanged, so no reset was needed."))
+    AppendStr(string(" <a href=/>Back to config</a></p></body></html>"))
+  else
+    AppendStr(string("<html><body><h1>SAVE FAILED</h1><p>The EEPROM write did not succeed - settings were NOT persisted, though they were still applied live for this session. <a href=/>Back to config</a></p></body></html>"))
   return cursor
 
 PUB ParseForm(bodyPtr, bodyLen, ipPtr, gwPtr, snPtr, p1Ptr, p2Ptr, p3Ptr, p4Ptr) | pos, keyStart, keyLen, valStart, valLen, eqPos, ampPos
