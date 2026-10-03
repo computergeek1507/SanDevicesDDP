@@ -35,9 +35,9 @@ entry                   mov     curMask, #1
                         mov     dira, curMask
                         mov     outa, #0
 
-sendLoop                mov     sendByte, #0            ' G = 0
-                        call    #clockByte
-                        mov     sendByte, #$FF          ' R = 255
+sendLoop                mov     sendByte, #$FF          ' R = 255 - this pixel reads bytes as R,G,B, not G,R,B
+                        call    #clockByte               ' (sending G,R,B order showed green instead of red - fixed)
+                        mov     sendByte, #0            ' G = 0
                         call    #clockByte
                         mov     sendByte, #0            ' B = 0
                         call    #clockByte
@@ -49,9 +49,9 @@ sendLoop                mov     sendByte, #0            ' G = 0
                         jmp     #sendLoop
 
 clockByte               mov     bitCnt, #8
-:bitloop                mov     time, cnt
-                        add     time, #40
-                        or      outa, curMask
+:bitloop                mov     time, cnt               ' "time" IS the moment the pin goes high (next instruction) -
+                        or      outa, curMask           ' no phantom pre-delay here; all deadlines below measure
+                                                        ' from this exact point, not from some later imagined "t=0"
 
                         test    sendByte, #%1000_0000   wz
 

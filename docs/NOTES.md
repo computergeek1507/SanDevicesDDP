@@ -107,21 +107,50 @@ real APA102/SK9822 hardware is on hand to validate against, rather than merging 
 timing models into one cog. `test/APA102_Pin_Test.spin` (a plain 1Hz GPIO toggle on the data/clock pins, no PASM
 timing involved) is still in the repo as a quick wiring sanity check if pixel output misbehaves again.
 
-**Follow-up (2026-10-01): found and fixed a real timing bug in the 4-port parallel driver.** Even after reverting
-to WS2812, `PixelDriver_E6804.spin` still showed nothing on real hardware, while `test/WS2812_Pin_Scanner.spin` (a
-single-pin version of the same bit-timing technique) correctly lit a WS2812 pixel on P0 - proving the WS2812
-encoding/timing approach itself was sound, and narrowing the bug to something specific about the 4-port parallel
-version. Found it by hand-counting PASM cycles: `bitloop` captured its timing reference (`mov time,cnt`) at the
-TOP of the loop, before computing `activemask`/`zeromask` across all 4 ports (8 conditional cmp/test instructions,
-~60+ cycles) - so by the time execution reached the first `waitcnt`, real elapsed time had already blown past the
-intended T0H deadline (32 cycles), making `waitcnt` return immediately instead of waiting. Every bit (whether
-nominally 0 or 1) ended up looking like an overlong high pulse (~250ns late drop) to the WS2812, which would
-reliably produce invalid/rejected data rather than any visible color - consistent with "completely dark,
-no color at all" being observed even on a successful DDP packet or a hardcoded red test. Fixed by moving the
-`activemask`/`zeromask` computation BEFORE capturing the timing reference, so `time := cnt` happens immediately
-before the pin actually goes high - matching exactly how the proven-working single-pin scanner is structured.
+**Correction (2026-10-01): pixel output was never actually confirmed working.** An earlier note (and a few hours of
+debugging direction) was based on a user report of "it lit up" / "it's P0" from `test/WS2812_Pin_Scanner.spin`,
+which turned out to be a mistaken report - it never actually worked, on any test, on any pin, with either pixel
+tried. Lesson for next time: when a hardware result is the only evidence a fix worked, it's worth a quick
+re-confirmation ("just to double check - you definitely saw red, not white/nothing?") before building further
+debugging direction on top of it, especially after a long back-and-forth where a quick yes/no answer is easy to
+give on autopilot.
+
+**Follow-up (2026-10-01): found two separate real timing bugs, not one.** First, in the 4-port parallel driver:
+`bitloop` captured its timing reference (`mov time,cnt`) at the TOP of the loop, before computing
+`activemask`/`zeromask` across all 4 ports (8 conditional cmp/test instructions, ~60+ cycles) - so by the time
+execution reached the first `waitcnt`, real elapsed time had already blown past the intended T0H deadline (32
+cycles). Fixed by moving the `activemask`/`zeromask` computation BEFORE capturing the timing reference.
+
+Second, and more fundamental - present in ALL versions including the single-pin test files, and only found by
+re-deriving the cycle count by hand after the "it worked" report turned out to be false: every `clockByte` routine
+had a `mov time,cnt` / `add time,#40` pair, intending "40 cycles of lead-in margin" before the first `waitcnt` -
+but the pin was being set high (`or outa,curMask`) on the very next instruction, with no actual `waitcnt` in
+between to consume those 40 cycles. So the pin's real high transition happened only ~4-8 cycles after reading
+`cnt`, while every subsequent T0H/T1H/period deadline was calculated as if it happened 40 cycles later. Net effect:
+every single pulse (0-bit and 1-bit alike) was stretched by roughly 40 extra cycles (~500ns) - turning the intended
+~0.4us/0.8us WS2812 pulses into something like ~0.75us/1.15us, well outside what the chip can reliably tell apart,
+and consistent with "always white/garbage, every test, every pin, every pixel tried" rather than an intermittent
+or pin-specific fault. Fixed by capturing `time := cnt` immediately before the single instruction that actually
+changes the pin, with nothing but that one instruction in between - not before an unwaited-for delay.
+
 Lesson: in PASM timing loops, capture your `cnt` reference as close as possible to the action being timed, after
 all variable-cost preparatory work, not before it.
+
+**Resolved (2026-10-01): WS2812 pixel output confirmed working on real hardware, properly this time.** After the
+"+40 phantom lead-in" fix, `test/WS2812_Static_Red.spin` (hardcoded single pixel, P0) first showed **green**
+instead of red - progress, since green/stable-color means the chip is now decoding valid timing data at all,
+versus the white/garbage seen in every prior attempt. Green instead of red meant this specific pixel reads incoming
+bytes as plain **R,G,B order**, not the G,R,B order many WS2812 chips use - swapping the byte order in the test
+(send R first, not G first) produced a correct, confirmed **red** pixel. `PixelDriver_E6804.spin` already passes
+bytes through unmodified (no reordering), and since R,G,B happens to match DDP's conventional RGB8 sender order
+already, no firmware change was needed there for color order - only the timing fixes above.
+
+**Confirmed (2026-10-01): the real 4-port `PixelDriver_E6804.spin` works on hardware.** `test/Pixel_Red_Test.spin`
+(hardcodes 10 red pixels on J1, bypassing W5200/DDP entirely, using the actual firmware pixel driver object) showed
+correct red on J1. Both PASM timing bugs and the byte-order fix are now validated in the real 4-port driver, not
+just the isolated single-pin test files. Remaining step to close the loop entirely: the full path through
+`Main.spin` (real DDP packet -> `DDP_Parser` -> shared frame buffer -> `PixelDriver_E6804` -> visible pixels), which
+exercises the same driver with live network data instead of a hardcoded buffer.
 
 ## W5200 bring-up troubleshooting (in progress, 2026-10-01)
 
@@ -139,6 +168,172 @@ wrong with the board, the traced pins, or the firmware. All the software-side ch
 outside anything traceable from the Propeller side. Worth remembering for next time: a dead/marginal cable produces
 symptoms that look exactly like a deeper hardware or SPI-pin problem (no link LED, no response) even though
 everything upstream of the cable is working correctly - cheap to rule out, should've been step zero.
+
+## P0 hardware fault found (2026-10-02) - explains every WS2812 "doesn't work" report
+
+After `test/WS2812_Static_Red.spin` (the absolute-minimal single-pixel test, freshly RAM-loaded, board not
+power-cycled in between) showed **completely dark** with no code changes from its previously-reported-working
+state, escalated to `test/Pin_Range_Test.spin` (plain `dira`/`outa` toggle of P0-P15 together, 1Hz, no PASM/timing
+at all) to separate "software/timing bug" from "something more fundamental." Result: **P0 does not toggle; P4 and
+P8 do**, probed directly on the P8X32A's own DIP pin (not at the board's J1 connector), so the board's
+74HCT541/158 buffer-and-mux chain was never in the measurement path.
+
+Since `Pin_Range_Test.spin` flips all 16 pins with one `outa` write (not a per-pin code path), this rules out a
+software/pin-selection bug entirely - 15 other pins toggling correctly on the same instruction, same cog, same
+run, while P0 alone doesn't, points at a **hardware fault specific to P0 on this physical Propeller chip** (or,
+less likely, a bad socket contact at that one pin).
+
+**This retroactively explains every WS2812 test failure on P0 to date**, including the "confirmed working, properly
+this time" report from 2026-10-01 above - that result may have been a brief genuine success before P0 failed (e.g.
+from damage during bring-up, such as driving a WS2812 data line directly without the board's normal series
+resistor if that test was wired as a direct bypass rather than through J1), or may itself have been another
+mistaken/unreliable report, consistent with this project's prior "it worked" false-positive (see the 2026-10-01
+correction above). Either way, none of the WS2812 driver PASM logic (single-pin or 4-port) should be considered
+suspect from this symptom - the dark-pixel reports were a P0 hardware problem, not a timing/logic bug.
+
+**Next step (not yet done): swap in a spare P8X32A chip** (the board's CPU is socketed specifically to allow this -
+see "Firmware update safety" below) and re-run `test/Pin_Range_Test.spin`, checking P0 again on the new chip. If P0
+toggles on the replacement chip, this chip's P0 I/O driver is damaged and it should be set aside; if P0 still
+doesn't toggle with a different chip in the socket, suspect the socket's P0 contact or a board trace, not the chip.
+Once P0 toggles on some known-good chip/socket combination, re-test `test/WS2812_Static_Red.spin` on that same
+setup before trusting any WS2812 timing result again.
+
+**Confirmed, not a software issue (2026-10-02):** revisited an earlier `test/Pixel_Red_Test_4Port.spin` run where
+"port 2 turned red" had been read as a working result worth worrying about alongside the new P0 failure. Port 2 is
+**J2 = P4** (not P0) - and J3 (P8) also lit correctly in that same run, while J1 (P0) did not. This matches
+`Pin_Range_Test.spin`'s result exactly (P4/P8 toggle, P0 doesn't) and confirms the pixel driver PASM - both the
+single-pin version and the real 4-port `PixelDriver_E6804.spin` - has been working correctly on every healthy pin
+all along. The only fault is the dead/faulty P0 line itself; nothing in the WS2812 timing or driver logic needs
+further suspicion from this symptom.
+
+**Confirmed (2026-10-02): full live path through `Main.spin` works on real hardware.** Sending a real DDP packet via
+`tools/send_test_ddp.py 192.168.5.206 255 0 0 400` (1200 bytes from offset 0) correctly lit J2/J3 red end-to-end:
+W5200 receive -> `DDP_Parser.ProcessPacket` -> shared frame buffer -> `PixelDriver_E6804` -> visible pixels. This
+closes the last open item from the plan/README status table.
+
+Note the default CLI usage (`pixel_count=10`, offset always 0) only ever touches J1's byte range (0-149) - with
+J1's pin dead, a default-arguments test run looks like "nothing happened," which isn't a bug, just not enough
+pixels requested to spill into another port's range.
+
+Open question: with all 4 ports at 50 pixels each (150 bytes/port, 600 bytes total), `pixel_count=200` (600 bytes)
+should mathematically be enough to span all 4 ports' ranges per `DDP_Parser.spin`'s interval-overlap math, but 400
+(1200 bytes - double the buffer's actual total size) is the value that was confirmed working; smaller values
+weren't methodically bisected. `rxUDP` in `W5200_Driver.spin` doesn't show an obvious size cap that would explain
+needing double (it reads the full packet length from the UDP header, well under the W5200's 2KB per-socket RX
+buffer) - worth bisecting the actual minimum (try 200, 250, 300...) if it matters for real usage, since xLights/DDP
+senders will send whatever size the sequence dictates, not a hand-picked safe value.
+
+## Config storage + web page (Step 6) - implemented, not yet tested on real hardware (2026-10-02)
+
+Added `src/I2C_EEPROM.spin` (plain-Spin bit-banged I2C, P28/P29 - the Propeller's own default boot pins, confirmed
+unchanged on this board via `docs/pin_mapping_E6804.md`), `src/Config.spin` (EEPROM-backed settings: MAC/IP/
+gateway/subnet, DDP port, per-port pixel counts), and `src/HTTPServer.spin` (minimal GET-form/POST-save config
+page), wired into `src/Main.spin`. Everything below is confirmed by **compiling with the real toolchain**
+(`flexspin`) - none of it has been run on the actual board yet, so treat it as "should work" not "works" until
+the verification checklist below is actually done on hardware.
+
+**EEPROM layout**: one 42-byte block at offset `$8000` (32768) - magic+version+MAC+IP+gateway+subnet+DDP port+4x
+per-port pixel counts+reserved bytes+a 16-bit additive checksum. `$8000` is safely above the full 32KB P1 boot
+image (every P1 `.eeprom` build pads to exactly 32768 bytes, confirmed earlier compiling `Main.spin` with `-e`),
+stays inside the same 64KB I2C block as the boot image (no block-select addressing needed), and is page-aligned
+(32768 = 128*256), so the whole block fits in one EEPROM page - one page-write, no page-split logic. A blank/
+never-written EEPROM reads all `$FF`, fails the magic check immediately, and `Config.Load` falls straight through
+to `LoadDefaults` (the same values that used to be Main.spin's fixed CON constants) - satisfies "still runs
+correctly on missing/corrupt config" with no special-case code.
+
+**Why a full reboot, not live reinitialization, after a config save**: confirmed by reading
+`PixelDriver_E6804.spin`'s PASM that it reads `portTable`/`pinTable` from hub RAM exactly once at `entry`, never
+again - so changing pixel counts live would need `pixels.Stop`/`Start` regardless, and would additionally leave
+open whether changing W5200 socket 0's address registers while it's carrying live DDP traffic is safe (the
+vendored driver's docs don't say, and there's no quick way to test it). A full `REBOOT` resets everything
+(W5200, pixel driver, port table) to the same known-good state a normal power-up reaches.
+
+**`REBOOT` verified by reading its compiled PASM output**, not just by trusting a web search: compiling a 3-line
+test (`test/Reboot_Smoke_Test.spin`) shows FlexSpin's `REBOOT` keyword compiles to exactly the standard, documented
+P1 software-reset technique - write the clock-mode byte to hub address `$0004` with the reset bit set (`#128`),
+then execute the `clkset` PASM instruction, which forces an immediate hard reset re-reading the boot EEPROM. This
+is the same mechanism as a real power cycle, not a hack - safe to rely on.
+
+**Real hub-RAM numbers** (`flexspin --sizes`, P1 target): before this feature, `Main.spin` used 8112 of 32768
+bytes. After adding `I2C_EEPROM.spin`/`Config.spin`/`HTTPServer.spin` and wiring them into `Main.spin` (including
+the new `MAX_PIXELS_PER_PORT = 300` framebuffer, up from the old fixed 50/port), the full build is **23,496 of
+32,768 bytes - 9,272 bytes free**. Comfortable margin; `MAX_PIXELS_PER_PORT = 300` doesn't need to come down.
+
+**MAC/IP/gateway/subnet form fields are plain decimal octets (ip0..ip3 etc.) and 2-hex-digit MAC bytes (mac0..
+mac5, no colons)** rather than single combined text fields - deliberately avoids needing any percent-decoding in
+`HTTPServer.spin`, since digits and hex letters are never percent-encoded by a standard form submission, but a
+colon (as in a conventional `02:00:00:00:00:01` MAC string) would be.
+
+**Known accepted risk, not fixed**: `W5200_Driver.spin`'s `txTCP` has an internal `repeat until freespace > 0` loop
+with no timeout. Not touched (it's vendored, working code) - low practical risk here since this feature's HTML
+responses are small and sent immediately after accept, so the TX buffer essentially always has room.
+
+**Found on real hardware (2026-10-02): I2C EEPROM read/write isn't working at all.** First real-hardware test
+showed the config web page loading fine (W5200/HTTP path confirmed working) but displaying garbage IP/gateway/
+subnet/pixel-count values on the very first-ever page load (no Save had been clicked). Traced systematically:
+`test/Config_Load_Save_Test.spin` (fallback/roundtrip/corruption checks) failed, then the even more isolated
+`test/I2C_EEPROM_Test.spin` (raw read/write roundtrip, no Config-level magic/checksum logic at all) ALSO failed -
+narrowing the bug to `src/I2C_EEPROM.spin` itself, not `Config.spin`'s validation logic or the HTTP integration.
+MAC and DDP port were also dropped from the configurable set per user decision (not needed) - `Config.spin`'s
+block shrank from 42 to 34 bytes accordingly (see its header comment for the current field table).
+
+Root cause not yet confirmed (no hardware access from this debugging session to test further), but a real,
+plausible one was identified and fixed defensively: **`I2C_EEPROM.Start()` never forced the bus to a known-idle
+state before the first transaction.** This board just booted FROM this same EEPROM over this same I2C bus (P28/
+P29 are the Propeller's hard-wired boot pins, not board-configurable) - if the boot ROM's last transaction didn't
+end perfectly cleanly, the EEPROM could be left mid-byte, waiting for more clock pulses, with SDA possibly stuck
+low. Added a standard I2C bus-recovery sequence to `Start()` (clock SCL up to 9 times watching for SDA to release,
+then force a clean STOP) before any real transaction - cheap, harmless even if this wasn't the actual cause.
+
+`test/I2C_EEPROM_Test.spin` was also upgraded with granular LED-coded failure reporting (1 blink = WriteBlock
+itself failed/never ACKed, 2 blinks = ReadBlock failed, 3 blinks = both succeeded but data didn't match) instead
+of a single pass/fail pattern, specifically so the next hardware run narrows this down further without another
+guess-and-reflash round-trip if the bus-recovery fix doesn't fully resolve it.
+
+**Confirmed (2026-10-02): the I2C bus-recovery fix resolved it.** Re-ran `test/I2C_EEPROM_Test.spin` on real
+hardware after adding the bus-recovery sequence to `I2C_EEPROM.Start()` - solid LED (PASS), write+read+data all
+matched. Root cause is now reasonably confirmed as "EEPROM left mid-transaction after boot, needed a forced
+recovery to idle before the first real transaction" rather than a logic bug in the read/write/ACK-check code
+itself (that code was apparently correct all along).
+
+**Found and fixed a second, separate bug (2026-10-02): the real cause of the original garbage-values symptom.**
+After the I2C bus-recovery fix, re-running the upgraded (blink-coded) `test/Config_Load_Save_Test.spin` showed
+check 1 (blank-EEPROM fallback) passing but check 2 (save/load roundtrip) failing - meaning Config's "is this
+data invalid" path worked, but a real write-then-read-back roundtrip of its `word`-sized fields didn't. This is
+exactly consistent with the risk flagged (but never actually verified) in the original plan: Config.spin's VAR
+block mixed `long`/`word`/`byte` fields and assumed Spin1 packs them byte-tight with no alignment padding. Check 1
+never actually exercised a real roundtrip of the word fields (it only confirms blank data is correctly rejected,
+which only depends on the `long magic` field matching - trivially true regardless of any padding elsewhere), so it
+couldn't have caught this. **Fixed by eliminating the assumption entirely**: `Config.spin` no longer uses a typed
+VAR struct at all - it's one flat `byte block[34]` array with hand-computed offset constants (`OFS_IP`,
+`OFS_PORT1`, etc.) and explicit `GetWord`/`SetWord`/`GetLong`/`SetLong` helpers that manually pack/unpack
+multi-byte fields as big-endian byte pairs. A byte array has no ambiguity about per-element packing, so there's no
+compiler behavior left to depend on. This is the actual root cause of the original "config page shows garbage on
+first load" symptom - it was never really about the I2C bus-recovery issue (that was a real, separate bug, just
+not THIS one) or about anything in the HTTP/buffer-sharing layer.
+
+Lesson for next time: when a hand-written data-layout assumption is flagged as "not yet verified" (or similar) in
+a plan, and the thing is non-trivial to verify quickly, treat it as a real risk worth structurally designing
+around (e.g., a flat byte array from the start) rather than proceeding on the assumption and hoping a later test
+catches it - in this case it took three separate rounds of hardware testing (full HTTP page, then two single-file
+isolated tests) to actually localize.
+
+**Confirmed (2026-10-02): the flat-byte-array fix resolved it.** Re-ran the updated `test/Config_Load_Save_Test.spin`
+on real hardware - solid LED, all three checks (blank-fallback, save/load roundtrip, corrupted-checksum rejection)
+passed. Both real bugs found during this feature's hardware bring-up (I2C bus-recovery, and the VAR-packing
+assumption) are now fixed and confirmed at the layer each one lives in.
+
+Note: `Config_Load_Save_Test.spin`'s check 3 deliberately leaves a corrupted checksum byte in the real EEPROM as
+its last action (that's the point of the test) - so the NEXT thing flashed (`Main.spin`) will correctly see
+"invalid" and boot from hardcoded defaults the first time, not because of a bug but because the test intentionally
+left the stored config corrupted. Expected, not a regression.
+
+**Still not yet done**: the full `Main.spin` GET/POST/reboot flow (load the config page, confirm it shows clean
+defaults - 192.168.5.206 / gateway 192.168.5.1 / subnet 255.255.255.0 / 50-50-50-50 pixels - submit a change,
+confirm it saves+reboots+persists). Given this project's own history of a false "it worked" report costing real
+debugging time (see the WS2812 entries above), don't update README's status table to "Done" based on isolated
+tests alone - confirm the full checklist in the plan file
+(`C:\Users\scoot\.claude\plans\humble-leaping-hamster.md`) on real hardware first.
 
 ## Firmware update safety
 

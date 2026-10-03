@@ -19,9 +19,9 @@ Repo: https://github.com/computergeek1507/SanDevicesDDP
 | 2. Pin-mapping discovery (multimeter tracing) | **E6804 fully traced**, including pixel data *and* clock pins - see `docs/pin_mapping_E6804.md`. E682 not started |
 | 3. W5200 Ethernet cog | **Confirmed working on real hardware**: link LED up, ping replies, DDP packets received (green activity LED toggles) - see `tools/send_test_ddp.py` |
 | 4. DDP receiver + parser | **Confirmed working on real hardware**: `src/DDP_Parser.spin` accepts real DDP packets sent to the board |
-| 5. Pixel output cog(s) | **In progress for E6804**: `src/PixelDriver_E6804.spin` is single-wire WS2812/WS2811 (matching the test strip on hand), not yet confirmed working on hardware. Board also has real APA102/SK9822-capable clock pins traced, planned as a follow-up dual-mode addition. E682's 16-port version not started |
-| 6. Config storage + web page | Not started - `src/Main.spin` currently has network/pixel-count config as fixed compile-time constants |
-| 7. Integration | **Network path fully proven on hardware.** Pixel output is the remaining unverified piece |
+| 5. Pixel output cog(s) | **Confirmed working on real hardware**: `src/PixelDriver_E6804.spin` (the real 4-port driver) correctly lights pixels red via `test/Pixel_Red_Test.spin`. Two real PASM timing bugs and a byte-order mismatch found and fixed along the way - see `docs/NOTES.md`. Board also has real APA102/SK9822-capable clock pins traced, planned as a follow-up dual-mode addition. E682's 16-port version not started |
+| 6. Config storage + web page | **Implemented, compiles clean - not yet verified on real hardware.** `src/Config.spin` (EEPROM-backed MAC/IP/gateway/subnet/DDP port/per-port pixel counts) + `src/HTTPServer.spin` (minimal config web page) wired into `src/Main.spin`; saving reboots the board to apply. See `docs/NOTES.md` for the design and what's still unverified |
+| 7. Integration | **Done** - full live path confirmed on real hardware: a real DDP packet through `Main.spin` -> `DDP_Parser` -> shared frame buffer -> `PixelDriver_E6804` correctly lit J2/J3 red. (J1 has a known-dead pin, unrelated to this firmware - see `docs/NOTES.md`.) |
 | 8. DMX512 output mode | Requested, not started - see caveat in `docs/NOTES.md` about this board having no RS-485 transceiver, so it'd be logic-level DMX framing, not electrically-real DMX512 |
 | 9. APA102/SK9822 dual-mode pixel output | Requested, not started - board's per-port clock pins are real and traced; needs actual APA102/SK9822 hardware to test against, and a second PASM cog (separate from the WS2812 one - the two protocols' timing doesn't mix well in one cog) |
 
@@ -32,11 +32,19 @@ W5200 comes up (link LED on, replies to ping at `192.168.5.206` - adjust `IP0`..
 own LAN), and sending a test packet with `tools/send_test_ddp.py` makes the green activity LED toggle, confirming
 `DDP_Parser.spin` is correctly accepting real packets end-to-end.
 
-**Pixel output is the remaining open item.** It briefly went through an APA102/SK9822 2-wire detour after tracing
-found real clock pins per port, but the bench pixel strip turned out to be WS2812 (single-wire, no clock input), so
-`PixelDriver_E6804.spin` is back to single-wire WS2812/WS2811 timing to match what's actually testable right now.
-Not yet confirmed working on hardware - see `docs/NOTES.md` for the full back-and-forth and `test/APA102_Pin_Test.spin`
-for an isolated GPIO-toggle sanity check if pixel output still doesn't behave once tested.
+**Pixel output is now confirmed working on real hardware** - `test/Pixel_Red_Test.spin` (the actual
+`PixelDriver_E6804.spin` firmware object, hardcoded to 10 red pixels on J1) shows correct red. Getting there took
+finding and fixing two real PASM timing bugs and a byte-order mismatch (this pixel wants plain R,G,B, not the G,R,B
+order many WS2812 chips use) - see `docs/NOTES.md` for the full story, including an earlier false "it worked"
+report that sent debugging in the wrong direction for a while (worth a read for the lesson on re-confirming
+hardware results).
+
+**The full live path through `Main.spin` is now confirmed end-to-end on real hardware** - `tools/send_test_ddp.py
+192.168.5.206 255 0 0 400` (a `pixel_count` large enough to span past J1's byte range) correctly lit J2/J3 red via
+`DDP_Parser` -> shared frame buffer -> `PixelDriver_E6804`. J1 separately turned out to have a dead/faulty pin
+(confirmed via `test/Pin_Range_Test.spin` - P0 doesn't toggle at all, even with plain GPIO and no PASM timing
+involved), unrelated to any of the driver/parser code - see `docs/NOTES.md` for the full diagnosis (including an
+open question there about why 400 was needed, not the smaller value the port byte-math suggested should suffice).
 
 ## Why start with the parser
 
@@ -52,7 +60,10 @@ separately.
 
 ## Remaining work
 
-- Confirm WS2812 pixel output actually works on real hardware (the one piece not yet verified)
+- Verify Config storage + web page (Step 6) on real hardware - it currently only has "compiles clean" behind it,
+  not an actual hardware test. See the checklist in `docs/NOTES.md` / the plan file.
+- Swap in a spare P8X32A chip to recover J1 (P0 doesn't toggle on the current chip - see `docs/NOTES.md`), or
+  confirm it's a socket/board fault instead if a replacement chip doesn't fix it either
 - Add APA102/SK9822 dual-mode pixel output (requested) once real APA102/SK9822 hardware is available to test -
   needs a second PASM cog, not merged into the WS2812 one
 - Add a DMX512 output mode (requested) - likely a separate small driver object, selectable per port

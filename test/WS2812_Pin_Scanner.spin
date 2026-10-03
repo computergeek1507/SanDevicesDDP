@@ -70,9 +70,9 @@ pinLoop                 mov     ledMask, #1
                         mov     outa, #0
 
                         mov     repCnt, holdRepeats
-sendLoop                mov     sendByte, #0            ' G = 0
+sendLoop                mov     sendByte, #$FF          ' R = 255 - confirmed R,G,B order on this pixel (not G,R,B)
                         call    #clockByte
-                        mov     sendByte, #$FF          ' R = 255 (full red)
+                        mov     sendByte, #0            ' G = 0
                         call    #clockByte
                         mov     sendByte, #0            ' B = 0
                         call    #clockByte
@@ -90,9 +90,8 @@ sendLoop                mov     sendByte, #0            ' G = 0
 
 ' --- clockByte: shifts sendByte out MSB-first on curMask, standard WS2812 single-wire timing ------------------
 clockByte               mov     bitCnt, #8
-:bitloop                mov     time, cnt
-                        add     time, #40
-                        or      outa, curMask           ' t=0: pin goes high
+:bitloop                mov     time, cnt               ' "time" IS the moment the pin goes high (next instruction) -
+                        or      outa, curMask           ' no phantom pre-delay; deadlines below measure from here
 
                         test    sendByte, #%1000_0000   wz
 

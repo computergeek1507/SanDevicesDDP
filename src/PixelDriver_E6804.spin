@@ -24,9 +24,16 @@
   the rest of the bit period - so all 4 output streams share one timing reference and stay in lockstep regardless
   of their individual byte content.
 
-  NOT YET COMPILED OR TESTED ON HARDWARE - verify bit timing against your actual pixel string's datasheet (or a
-  logic analyzer/scope) before fully trusting this; the W5200/DDP receive path is confirmed working on real
-  hardware, but this specific driver has not been.
+  The underlying bit-timing technique (and a real timing bug in it - see docs/NOTES.md) has been confirmed against
+  real hardware via test/WS2812_Static_Red.spin - a single-pin version of the exact same clockByte approach used
+  here, which now correctly lights a WS2812 pixel red. This 4-port version has the same bug fixes applied but
+  hasn't itself been re-tested on hardware since - verify with test/Pixel_Red_Test.spin before fully trusting it.
+
+  Byte order: this driver passes the 3 bytes per pixel straight from the frame buffer onto the wire, unmodified -
+  no reordering. The test pixel used for bring-up turned out to want plain R,G,B order (not the G,R,B order many
+  WS2812 chips use), which happens to match DDP's conventional RGB8 sender order already, so no reordering was
+  needed here. If a future pixel type wants a different order, handle it at the sender (e.g. xLights' per-output
+  color-order setting) rather than adding reordering logic here, to keep this driver protocol-agnostic about it.
 }}
 
 CON
@@ -167,10 +174,15 @@ bitloop                 mov     activemask, #0
                         ' Timing reference is captured HERE, right before actually going high - not at the top of
                         ' this loop - because the port-checking work above (8 conditional cmp/test instructions)
                         ' takes ~60+ cycles, which blew past the T0H deadline if "time" was set before doing it
-                        ' (a real bug found during hardware bring-up: every bit looked like an overlong high pulse
-                        ' to the WS2812, since T0H fired ~250ns late - see docs/NOTES.md).
+                        ' (a real bug found during hardware bring-up - see docs/NOTES.md). A second, separate bug
+                        ' was fixed here too: there used to be a "+40 cycle lead-in" added to "time" before this
+                        ' point, but since nothing ever actually WAITED for those 40 cycles (the pin goes high on
+                        ' the very next instruction), every deadline below was being measured 40 cycles later than
+                        ' the pin's real high transition - silently stretching every pulse (0-bit and 1-bit alike)
+                        ' by ~500ns, well outside what a WS2812 can reliably tell apart. "time" must be captured
+                        ' immediately before the instruction that actually changes the pin, with nothing but a
+                        ' single OR in between - not before a delay that's never waited for.
                         mov     time, cnt
-                        add     time, #40               ' small lead-in before first waitcnt
                         or      outa, activemask       ' t=0: all active pins go high together
 
                         add     time, #T0H_CYC
